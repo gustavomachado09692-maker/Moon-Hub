@@ -1,0 +1,2551 @@
+--[[
+    Moon Hub ( No-Key ) [ BETA ] - Blox Fruits (Mar 1, 2 e 3)
+    UI: Fluent
+    Abas: Status | Settings | Normal Farm | Stack Farm | Fruits
+
+    Prioridade de execução (de cima para baixo):
+        1) Auto Collect Fruit
+        2) Auto Random Fruit (só quando o cooldown de 2h acabou)
+        3) Stack Farm (Pirate Raid, Elite Hunter, Factory)
+        4) Normal Farm (Level, Dough Prince, Bones)
+
+    OBS: nomes de remotes, quests e coordenadas mudam a cada update do jogo.
+    Os dados abaixo foram escritos a partir de wikis/guias e NÃO foram testados
+    dentro do jogo. Se algo falhar, veja a linha "Diagnóstico" na aba Status.
+]]
+
+-- ============ RE-EXECUÇÃO: fecha a versão anterior se existir ============
+local genv = (getgenv and getgenv()) or _G
+if genv.MoonHubUnload then pcall(genv.MoonHubUnload) end
+local Alive = true
+local Connections = {}
+local Fluent -- definido mais abaixo (usado pelo unload)
+local Window -- idem (o clique precisa saber onde a janela está)
+
+-- ============ SERVIÇOS ============
+local Players             = game:GetService("Players")
+local RunService          = game:GetService("RunService")
+local TweenService        = game:GetService("TweenService")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local VirtualUser         = game:GetService("VirtualUser")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService    = game:GetService("UserInputService")
+
+local Player = Players.LocalPlayer
+
+-- Remotes do Blox Fruits: espera até 5s; fora do jogo ficam nil e o script NÃO trava
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 5)
+local CommF   = Remotes and Remotes:WaitForChild("CommF_", 5)
+local CommE   = Remotes and Remotes:FindFirstChild("CommE")
+local IsBloxFruits = CommF ~= nil
+
+-- Chama um RemoteFunction com segurança. Retorna (ok, resposta)
+local function invoke(...)
+    if not CommF then return false, "remote CommF_ não encontrado" end
+    return pcall(CommF.InvokeServer, CommF, ...)
+end
+
+local function getPlayerLevel()
+    local ok, lvl = pcall(function() return Player.Data.Level.Value end)
+    return ok and lvl or 1
+end
+
+-- ============ CONFIGURAÇÃO ============
+local Config = {
+    -- Normal Farm (só um modo por vez): nil | "Level" | "Dough" | "Bones"
+    Mode            = nil,
+    AutoQuestDough  = true,
+    AutoQuestBones  = true,
+    KillDoughPrince = false, SummonDoughPrince = false,
+    AutoQuestKing   = true,  KillDoughKing = false, SummonDoughKing = false,
+    RandomBones     = false, SummonReaper = false, KillReaper = false,
+    EliteQuest      = true,
+    -- Stack Farm
+    PirateRaid      = false,
+    Elite           = false,
+    Factory         = false,
+    -- Fruits
+    AutoGacha       = false,
+    AutoStore       = false,
+    CollectFruits   = false,
+    -- Settings
+    Weapon          = "Melee",         -- "Melee" (soco) | "Sword" | "Gun" | "Blox Fruit"
+    Bring           = 2,               -- quantos mobs puxar (2 a 10)
+    AutoBuso        = true,            -- Haki do Armamento (ligado por padrão)
+    AutoKen         = false,           -- Haki da Observação (desligado por padrão)
+    AutoV3          = false,           -- habilidade da raça V3 (Auto Use V3)
+    AutoV4          = false,           -- despertar da raça V4 (Auto Use V4)
+    -- Fruits: Auto Buy (stock normal) com ordem de prioridade
+    AutoBuy         = false,
+    BuyPrio         = { "Nenhuma", "Nenhuma", "Nenhuma", "Nenhuma", "Nenhuma" },
+    -- Raids
+    RaidType        = "Flame",
+    AutoStartRaid   = false,
+    AutoRaid        = false,
+    AutoPay         = false,
+    PayMode         = "Beli",          -- "Beli" | "Fruta"
+    PayOnly1M       = false,           -- só frutas abaixo de 1M (nunca Lendária/Mítica)
+    AttackMode      = "Normal Attack", -- Normal Attack | Fast Attack | Super Fast Attack
+    AttackMethod    = "Auto",          -- Auto | Net | Mouse | Touch | VirtualUser | CombatFramework | Tool
+    TweenSpeed      = 200,             -- studs por segundo
+    HoverHeight     = 26,              -- altura do jogador sobre os mobs
+    Interval        = 0.15,            -- intervalo do loop principal
+    SeaOverride     = nil,             -- nil = detecta sozinho
+    AttackUntil     = 0,               -- os.clock() até quando o ataque fica ligado
+}
+
+-- Cliques por segundo de cada modo de ataque (com variação aleatória de ±15%)
+local AttackCPS = { ["Normal Attack"] = 3, ["Fast Attack"] = 20, ["Super Fast Attack"] = 40 }
+
+local State = { Mode = "Parado", Text = "—", Busy = false }
+local Diag  = { bones = "—", quest = "—", summon = "—", elite = "—", gacha = "—", fight = "—", attack = "—", ken = "—", buy = "—", raid = "—" }
+local StartTime = os.time()
+
+-- ============ ARQUIVOS (persistência, se o executor suportar) ============
+local function canFile()
+    return type(isfile) == "function" and type(readfile) == "function" and type(writefile) == "function"
+end
+
+-- Primeira execução do script (guardada em arquivo para sobreviver entre sessões)
+local FirstRun = os.time()
+pcall(function()
+    if canFile() then
+        if isfile("MoonHub_first_run.txt") then
+            local n = tonumber(readfile("MoonHub_first_run.txt"))
+            if n then FirstRun = n end
+        else
+            writefile("MoonHub_first_run.txt", tostring(FirstRun))
+        end
+    end
+end)
+
+-- ============ TABELAS DE QUESTS ============
+-- Q(levelMin, levelMax, quest, índice, mob(s), x, y, z do NPC)
+-- QN(levelMin, levelMax, mob(s)) = sem NPC conhecido: só farma os mobs (sem quest)
+local function Q(min, max, quest, idx, mobs, x, y, z)
+    if type(mobs) == "string" then mobs = { mobs } end
+    return {
+        min = min, max = max, quest = quest, idx = idx,
+        mobs = mobs, mob = mobs[1],
+        npc = x and CFrame.new(x, y, z) or nil,
+    }
+end
+local function QN(min, max, mobs) return Q(min, max, nil, nil, mobs) end
+
+local QuestTables = {
+    -- ===== MAR 1 (1-699) =====
+    [1] = {
+        Q(1,   9,   "BanditQuest1",   1, "Bandit",              1059, 17, 1546),
+        Q(10,  14,  "JungleQuest",    1, "Monkey",              -1598, 36, 153),
+        Q(15,  29,  "JungleQuest",    2, "Gorilla",             -1598, 36, 153),
+        Q(30,  39,  "BuggyQuest1",    1, "Pirate",              -1141, 4, 3831),
+        Q(40,  59,  "BuggyQuest1",    2, "Brute",               -1141, 4, 3831),
+        Q(60,  74,  "DesertQuest",    1, "Desert Bandit",       894, 5, 4392),
+        Q(75,  89,  "DesertQuest",    2, "Desert Officer",      894, 5, 4392),
+        Q(90,  99,  "SnowQuest",      1, "Snow Bandit",         1386, 87, -1298),
+        Q(100, 119, "SnowQuest",      2, "Snowman",             1386, 87, -1298),
+        Q(120, 149, "MarineQuest2",   1, "Chief Petty Officer", -5035, 29, 4325),
+        Q(150, 174, "SkyQuest",       1, "Sky Bandit",          -4841, 717, -2623),
+        Q(175, 189, "SkyQuest",       2, "Dark Master",         -4841, 717, -2623),
+        Q(190, 209, "PrisonerQuest",  1, "Prisoner",            5310, 1, 474),
+        Q(210, 249, "PrisonerQuest",  2, "Dangerous Prisoner",  5310, 1, 474),
+        Q(250, 274, "ColosseumQuest", 1, "Toga Warrior",        -1580, 7, -2986),
+        Q(275, 299, "ColosseumQuest", 2, "Gladiator",           -1580, 7, -2986),
+        Q(300, 324, "MagmaQuest",     1, "Military Soldier",    -5313, 10, 8515),
+        Q(325, 374, "MagmaQuest",     2, "Military Spy",        -5313, 10, 8515),
+        Q(375, 399, "FishmanQuest",   1, "Fishman Warrior",     61122, 18, 1567),
+        Q(400, 449, "FishmanQuest",   2, "Fishman Commando",    61122, 18, 1567),
+        Q(450, 474, "SkyExp1Quest",   1, "God's Guard",         -4721, 845, -1953),
+        Q(475, 524, "SkyExp1Quest",   2, "Shanda",              -7859, 5544, -381),
+        Q(525, 549, "SkyExp2Quest",   1, "Royal Squad",         -7903, 5636, -1412),
+        Q(550, 624, "SkyExp2Quest",   2, "Royal Soldier",       -7903, 5636, -1412),
+        Q(625, 649, "FountainQuest",  1, "Galley Pirate",       5259, 37, 4050),
+        Q(650, 9999,"FountainQuest",  2, "Galley Captain",      5259, 37, 4050),
+    },
+    -- ===== MAR 2 (700-1499) =====
+    [2] = {
+        Q(700,  724,  "Area1Quest",        1, "Raider",            -427, 73, 1835),
+        Q(725,  774,  "Area1Quest",        2, "Mercenary",         -427, 73, 1835),
+        Q(775,  799,  "Area2Quest",        1, "Swan Pirate",       638, 71, 918),
+        Q(800,  874,  "Area2Quest",        2, "Factory Staff",     638, 71, 918),
+        Q(875,  899,  "MarineQuest3",      1, "Marine Lieutenant", -2440, 73, -3217),
+        Q(900,  949,  "MarineQuest3",      2, "Marine Captain",    -2440, 73, -3217),
+        Q(950,  974,  "ZombieQuest",       1, "Zombie",            -5497, 48, -795),
+        Q(975,  999,  "ZombieQuest",       2, "Vampire",           -5497, 48, -795),
+        Q(1000, 1049, "SnowMountainQuest", 1, "Snow Trooper",      609, 400, -5372),
+        Q(1050, 1099, "SnowMountainQuest", 2, "Winter Warrior",    609, 400, -5372),
+        Q(1100, 1124, "IceSideQuest",      1, "Lab Subordinate",   -6064, 15, -4902),
+        Q(1125, 1174, "IceSideQuest",      2, "Horned Warrior",    -6064, 15, -4902),
+        Q(1175, 1199, "FireSideQuest",     1, "Magma Ninja",       -5428, 15, -5299),
+        Q(1200, 1249, "FireSideQuest",     2, "Lava Pirate",       -5428, 15, -5299),
+        Q(1250, 1274, "ShipQuest1",        1, "Ship Deckhand",     1037, 125, 32911),
+        Q(1275, 1299, "ShipQuest1",        2, "Ship Engineer",     1037, 125, 32911),
+        Q(1300, 1324, "ShipQuest2",        1, "Ship Steward",      968, 125, 33244),
+        Q(1325, 1349, "ShipQuest2",        2, "Ship Officer",      968, 125, 33244),
+        Q(1350, 1374, "FrostQuest",        1, "Arctic Warrior",    5668, 28, -6484),
+        Q(1375, 1424, "FrostQuest",        2, "Snow Lurker",       5668, 28, -6484),
+        Q(1425, 1449, "ForgottenQuest",    1, "Sea Soldier",       -3054, 235, -10142),
+        Q(1450, 9999, "ForgottenQuest",    2, "Water Fighter",     -3054, 235, -10142),
+    },
+    -- ===== MAR 3 (1500+) =====
+    [3] = {
+        Q(1500, 1524, "PiratePortQuest",     1, "Pirate Millionaire",   -290, 44, 5577),
+        Q(1525, 1574, "PiratePortQuest",     2, "Pistol Billionaire",   -290, 44, 5577),
+        Q(1575, 1599, "AmazonQuest",         1, "Dragon Crew Warrior",  5833, 51, -1103),
+        Q(1600, 1624, "AmazonQuest",         2, "Dragon Crew Archer",   5833, 51, -1103),
+        -- Hydra Island: a wiki atual lista Hydra Enforcer/Venomous Assailant; scripts antigos usam Female/Giant Islander
+        Q(1625, 1649, "AmazonQuest2",        1, { "Hydra Enforcer", "Female Islander" },    5448, 602, 748),
+        Q(1650, 1699, "AmazonQuest2",        2, { "Venomous Assailant", "Giant Islander" }, 5448, 602, 748),
+        Q(1700, 1724, "MarineTreeIsland",    1, "Marine Commodore",     2180, 29, -6738),
+        Q(1725, 1774, "MarineTreeIsland",    2, "Marine Rear Admiral",  2180, 29, -6738),
+        Q(1775, 1799, "DeepForestIsland3",   1, "Fishman Raider",       -10581, 330, -8761),
+        Q(1800, 1824, "DeepForestIsland3",   2, "Fishman Captain",      -10581, 330, -8761),
+        Q(1825, 1849, "DeepForestIsland",    1, "Forest Pirate",        -13234, 332, -7626),
+        Q(1850, 1899, "DeepForestIsland",    2, "Mythological Pirate",  -13234, 332, -7626),
+        Q(1900, 1924, "DeepForestIsland2",   1, "Jungle Pirate",        -12680, 389, -9902),
+        Q(1925, 1974, "DeepForestIsland2",   2, "Musketeer Pirate",     -12680, 389, -9902),
+        Q(1975, 1999, "HauntedQuest1",       1, "Reborn Skeleton",      -9479, 141, 5566),
+        Q(2000, 2024, "HauntedQuest1",       2, "Living Zombie",        -9479, 141, 5566),
+        Q(2025, 2049, "HauntedQuest2",       1, "Demonic Soul",         -9516, 172, 6078),
+        Q(2050, 2074, "HauntedQuest2",       2, "Posessed Mummy",       -9516, 172, 6078),
+        Q(2075, 2099, "NutsIslandQuest",     1, "Peanut Scout",         -2105, 38, -10195),
+        Q(2100, 2124, "NutsIslandQuest",     2, "Peanut President",     -2105, 38, -10195),
+        Q(2125, 2149, "IceCreamIslandQuest", 1, "Ice Cream Chef",       -820, 65, -10965),
+        Q(2150, 2199, "IceCreamIslandQuest", 2, "Ice Cream Commander",  -820, 65, -10965),
+        Q(2200, 2224, "CakeQuest1",          1, "Cookie Crafter",       -2022, 36, -12029),
+        Q(2225, 2249, "CakeQuest1",          2, "Cake Guard",           -2022, 36, -12029),
+        Q(2250, 2274, "CakeQuest2",          1, "Baking Staff",         -1928, 37, -12840),
+        Q(2275, 2299, "CakeQuest2",          2, "Head Baker",           -1928, 37, -12840),
+        Q(2300, 2324, "ChocQuest1",          1, "Cocoa Warrior",        231, 23, -12200),
+        Q(2325, 2349, "ChocQuest1",          2, "Chocolate Bar Battler",231, 23, -12200),
+        Q(2350, 2374, "ChocQuest2",          1, "Sweet Thief",         151, 23, -12775),
+        Q(2375, 2399, "ChocQuest2",          2, "Candy Rebel",         151, 23, -12775),
+        Q(2400, 2424, "CandyQuest1",         1, "Candy Pirate",        -1149, 14, -14445),
+        Q(2425, 2449, "CandyQuest1",         2, "Snow Demon",          -1149, 14, -14445),
+        -- Acima de 2450 (Tiki Outpost / Submerged Island) não tenho NPC nem quest confirmados:
+        -- só farma os mobs, sem aceitar quest. Os níveis abaixo são aproximados.
+        QN(2450, 2474, "Isle Outlaw"),
+        QN(2475, 2499, "Island Boy"),
+        QN(2500, 2524, "Sun-kissed Warrior"),
+        QN(2525, 2549, "Isle Champion"),
+        QN(2550, 2574, "Serpent Hunter"),
+        QN(2575, 2599, "Skull Slayer"),
+        QN(2600, 2624, "Reef Bandit"),
+        QN(2625, 2649, "Coral Pirate"),
+        QN(2650, 2674, "Sea Chanter"),
+        QN(2675, 9999, "Ocean Prophet"),
+    },
+}
+
+-- Última missão da ilha do Dough Prince (Cake Land) e do Haunted Castle (Bones)
+local DoughQuest = Q(2275, 9999, "CakeQuest2",    2, "Head Baker",     -1928, 37, -12840)
+local BonesQuest = Q(2050, 9999, "HauntedQuest2", 2, "Posessed Mummy", -9516, 172, 6078)
+-- Se o mob da quest sumir, bate em qualquer outro mob da mesma ilha
+local CakeMobs     = { "Head Baker", "Baking Staff", "Cake Guard", "Cookie Crafter" }
+local HauntedMobs  = { "Posessed Mummy", "Demonic Soul", "Living Zombie", "Reborn Skeleton" }
+local BossNames    = { "Cake Prince", "Dough King" }
+local EliteNames   = { "Deandre", "Urban", "Diablo" }
+
+-- Mobs dos Mares 1 e 2 (nomes exatos) - no Mar 3 só aparecem durante o Pirate Raid
+local RaidSet = {}
+do
+    local sea3 = {}
+    for _, q in ipairs(QuestTables[3]) do for _, n in ipairs(q.mobs) do sea3[n] = true end end
+    for _, sea in ipairs({ 1, 2 }) do
+        for _, q in ipairs(QuestTables[sea]) do
+            for _, n in ipairs(q.mobs) do
+                if not sea3[n] then RaidSet[n] = true end
+            end
+        end
+    end
+end
+
+-- ============ MAR (detecção sem bloqueio) ============
+-- 1) escolha manual  2) PlaceId conhecido  3) pelo level
+local SeaFromPlace = { [2753915549] = 1, [4442272183] = 2, [7449423635] = 3 }
+local function getSea()
+    if Config.SeaOverride then return Config.SeaOverride end
+    local byPlace = SeaFromPlace[game.PlaceId]
+    if byPlace then return byPlace end
+    local lvl = getPlayerLevel()
+    if lvl >= 1500 then return 3 elseif lvl >= 700 then return 2 end
+    return 1
+end
+
+-- ============ PERSONAGEM / MOVIMENTO ============
+local function getChar()
+    local char = Player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hrp and hum and hum.Health > 0 then return char, hrp, hum end
+end
+
+local function distanceTo(cf)
+    local _, hrp = getChar()
+    return hrp and (hrp.Position - cf.Position).Magnitude or math.huge
+end
+
+-- Voo suave por tween (duração proporcional à distância e à velocidade)
+local currentTween
+local function flyTo(targetCF)
+    local _, hrp = getChar()
+    if not hrp then return end
+    local dist = (hrp.Position - targetCF.Position).Magnitude
+    if dist < 4 then return end
+    if currentTween then currentTween:Cancel() end
+    currentTween = TweenService:Create(hrp,
+        TweenInfo.new(dist / Config.TweenSpeed, Enum.EasingStyle.Linear),
+        { CFrame = targetCF })
+    currentTween:Play()
+end
+
+-- Noclip + flutuação enquanto o script estiver controlando o personagem
+local NoclipLast = 0
+table.insert(Connections, RunService.Stepped:Connect(function()
+    if not (Alive and State.Busy) then return end
+    local char, hrp = getChar()
+    if not char then return end
+    local now = os.clock()
+    if now - NoclipLast > 0.2 then
+        NoclipLast = now
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
+        end
+    end
+    if not hrp:FindFirstChild("FarmHold") then
+        local bv = Instance.new("BodyVelocity")
+        bv.Name = "FarmHold"
+        bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+        bv.Velocity = Vector3.zero
+        bv.Parent = hrp
+    end
+end))
+
+local function releaseChar()
+    local _, hrp = getChar()
+    if hrp and hrp:FindFirstChild("FarmHold") then hrp.FarmHold:Destroy() end
+    if currentTween then currentTween:Cancel() end
+end
+
+-- ============ ARMAS ============
+-- Procura uma ferramenta pelo tipo (ToolTip): Melee | Sword | Gun | Blox Fruit
+local function findTool(tip)
+    local function scan(container)
+        if not container then return end
+        for _, t in ipairs(container:GetChildren()) do
+            if t:IsA("Tool") and t.ToolTip == tip then
+                -- frutas físicas (no inventário) têm "Fruit" no nome: não são a fruta comida
+                if not (tip == "Blox Fruit" and string.find(t.Name, "Fruit")) then return t end
+            end
+        end
+    end
+    local eq = scan(Player.Character)
+    if eq then return eq, true end
+    local bp = scan(Player.Backpack)
+    if bp then return bp, false end
+end
+
+local function equipWeapon()
+    local char, _, hum = getChar()
+    if not char then return end
+    local tool, equipped = findTool(Config.Weapon)
+    if tool and not equipped then hum:EquipTool(tool) end
+end
+
+-- Frutas com M1 suportado (a fruta que você comeu: Dragon East/West, T-Rex, Gas, Ice, Light)
+local FRUIT_M1 = { "dragon", "t-rex", "gas", "ice", "light" }
+local function fruitNote()
+    if Config.Weapon ~= "Blox Fruit" then return "" end
+    local tool = findTool("Blox Fruit")
+    if not tool then return " | fruta: nenhuma fruta comida encontrada" end
+    local n = string.lower(tool.Name)
+    for _, k in ipairs(FRUIT_M1) do
+        if string.find(n, k, 1, true) then return " | fruta M1: " .. tool.Name .. " (ok)" end
+    end
+    return " | fruta M1: " .. tool.Name .. " (fora da lista: Dragon, T-Rex, Gas, Ice, Light)"
+end
+
+-- ============ ATAQUE ============
+-- O jogo só registra o golpe se o clique for "real" e o cursor estiver sobre o mob.
+-- Por isso: (1) a câmera é apontada para o mob e o clique cai FORA da janela da Fluent;
+-- (2) existem vários métodos de ataque. O script mede se o mob perdeu vida e, se não perdeu,
+--     troca sozinho de método (e depois desce a altura) até achar uma combinação que cause dano.
+local Aim = { part = nil, on = false, camChanged = false, px = nil, py = nil, level = false }
+-- Ciclo automático: sem Mouse/Touch (clique sintético trava o cursor). Esses dois continuam no menu, só manual.
+local METHODS = { "Net", "CombatFramework", "Tool", "VirtualUser" }
+local Watch = { enemy = nil, hp = 0, lastDmg = 0, mi = 1, stage = 0, confirmed = false, skip = {} }
+local Fail = {}
+
+local function currentMethod()
+    -- Gun / Blox Fruit: dispara com Tool:Activate (sem clique sintético) e a câmera mira no cursor
+    if Config.Weapon == "Gun" and (Config.AttackMethod == "Auto" or Config.AttackMethod == "Net") then
+        return "Tool"
+    end
+    return (Config.AttackMethod ~= "Auto") and Config.AttackMethod or METHODS[Watch.mi]
+end
+
+local function restoreCamera()
+    if not Aim.camChanged then return end
+    Aim.camChanged = false
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        cam.CameraType = Enum.CameraType.Custom
+        local _, _, hum = getChar()
+        if hum then cam.CameraSubject = hum end
+    end)
+end
+
+-- Retângulo da janela da Fluent (para o clique nunca cair em cima dela)
+local function windowRect()
+    local ok, r = pcall(function()
+        local root = Window and Window.Root
+        if root then
+            if not root.Visible then return false end
+            local p, sz = root.AbsolutePosition, root.AbsoluteSize
+            return { p.X, p.Y, p.X + sz.X, p.Y + sz.Y }
+        end
+    end)
+    if ok and r == false then return nil end -- janela escondida
+    if ok and r then return r end
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    return { vp.X / 2 - 300, vp.Y / 2 - 240, vp.X / 2 + 300, vp.Y / 2 + 240 } -- estimativa
+end
+
+-- Posição atual do cursor (a câmera aponta o mob para ESSE pixel, então não é preciso clicar em outro lugar)
+local function cursorPoint(vp)
+    local ok, loc = pcall(function() return UserInputService:GetMouseLocation() end)
+    if ok and loc and loc.X > 1 and loc.Y > 1 and loc.X < vp.X - 1 and loc.Y < vp.Y - 1 then
+        return math.clamp(loc.X, vp.X * 0.1, vp.X * 0.9), math.clamp(loc.Y, vp.Y * 0.1, vp.Y * 0.9)
+    end
+    return vp.X * 0.5, vp.Y * 0.5
+end
+
+-- Escolhe um ponto da tela livre da janela
+local function safePoint(vp)
+    local rect = windowRect()
+    local cands = { { 0.88, 0.50 }, { 0.12, 0.50 }, { 0.88, 0.30 }, { 0.12, 0.30 }, { 0.50, 0.12 }, { 0.88, 0.70 } }
+    for _, c in ipairs(cands) do
+        local x, y = vp.X * c[1], vp.Y * c[2]
+        if (not rect) or x < rect[1] - 30 or x > rect[3] + 30 or y < rect[2] - 30 or y > rect[4] + 30 then
+            return x, y
+        end
+    end
+    return vp.X * 0.5, vp.Y * 0.5
+end
+
+-- Câmera olhando para o alvo, de modo que ele apareça exatamente no pixel (px, py)
+local function aimCFrame(camPos, target, px, py, vp, fov)
+    local base = CFrame.lookAt(camPos, target)
+    local t = math.tan(math.rad(fov) / 2)
+    local ax = math.atan(((px - vp.X / 2) / (vp.Y / 2)) * t)
+    local ay = math.atan(((py - vp.Y / 2) / (vp.Y / 2)) * t)
+    return base * CFrame.fromEulerAnglesYXZ(ay, ax, 0)
+end
+
+-- Clique/toque real (entra como input do jogador, o jogo não ignora)
+local function clickScreen(touch)
+    local cam = workspace.CurrentCamera
+    if not cam then return false end
+    local x, y = Aim.px, Aim.py
+    if not x then x, y = safePoint(cam.ViewportSize) end
+    return pcall(function()
+        if touch then
+            VirtualInputManager:SendTouchEvent(1, 0, x, y)
+            VirtualInputManager:SendTouchEvent(1, 2, x, y)
+        else
+            VirtualInputManager:SendMouseMoveEvent(x, y, game)
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+        end
+    end)
+end
+
+-- Chama o controlador de combate do próprio jogo (se o executor deixar ler o módulo)
+local CFW = { tried = false, ctrl = nil }
+local function cfAttack()
+    return pcall(function()
+        if not CFW.tried then
+            CFW.tried = true
+            local mod = require(Player.PlayerScripts:WaitForChild("CombatFramework", 3))
+            CFW.ctrl = getupvalues(mod)[2]
+        end
+        local ctrl = CFW.ctrl and CFW.ctrl.activeController
+        assert(ctrl, "activeController indisponível")
+        ctrl:attack()
+    end)
+end
+
+local doNetAttack -- definido na seção NET (logo abaixo da seção INIMIGOS)
+
+local function doAttack(method)
+    local ok = false
+    if method == "Net" then
+        ok = doNetAttack and doNetAttack() or false
+    elseif method == "Mouse" then
+        ok = clickScreen(false)
+    elseif method == "Touch" then
+        ok = clickScreen(true)
+    elseif method == "VirtualUser" then
+        ok = pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:Button1Down(Vector2.new(1280, 672))
+            VirtualUser:Button1Up(Vector2.new(1280, 672))
+        end)
+    elseif method == "CombatFramework" then
+        ok = cfAttack()
+    elseif method == "Tool" then
+        ok = pcall(function()
+            local char = Player.Character
+            local tool = char and char:FindFirstChildOfClass("Tool")
+            if tool then tool:Activate() end
+        end)
+    end
+    -- método que dá erro de API várias vezes seguidas é descartado do ciclo automático
+    if method == "Mouse" or method == "Touch" or method == "VirtualUser" then
+        Fail[method] = ok and 0 or ((Fail[method] or 0) + 1)
+        if Fail[method] >= 8 then Watch.skip[method] = true end
+    elseif method == "CombatFramework" and CFW.tried and not CFW.ctrl then
+        Watch.skip[method] = true
+    end
+end
+
+-- Câmera: enquanto ataca com Mouse/Touch, mantém o mob exatamente sob o cursor
+pcall(function() RunService:UnbindFromRenderStep("MoonHubAim") end)
+pcall(function()
+    RunService:BindToRenderStep("MoonHubAim", Enum.RenderPriority.Camera.Value + 1, function()
+        if not Alive then return end
+        pcall(function()
+            local cam = workspace.CurrentCamera
+            local _, hrp = getChar()
+            local part = Aim.part
+            if Aim.on and cam and hrp and part and part.Parent and Aim.px then
+                if cam.CameraType ~= Enum.CameraType.Scriptable then
+                    cam.CameraType = Enum.CameraType.Scriptable
+                end
+                Aim.camChanged = true
+                local camOff = Aim.level and Vector3.new(0, 3, -10) or Vector3.new(10, 8, 10) -- Gun: câmera reta, na altura do mob
+                cam.CFrame = aimCFrame(hrp.Position + camOff, part.Position,
+                    Aim.px, Aim.py, cam.ViewportSize, cam.FieldOfView)
+            elseif Aim.camChanged then
+                restoreCamera()
+            end
+        end)
+    end)
+end)
+
+-- Thread de ataque: só clica quando alguma rotina marcou "AttackUntil".
+-- Cada passo roda dentro de pcall: um erro isolado NÃO mata mais a thread (era o que fazia o ataque parar).
+local lastPoint = 0
+local function attackTick()
+    if not (State.Busy and os.clock() < Config.AttackUntil) then
+        Aim.on = false
+        return 0.1
+    end
+    local cam = workspace.CurrentCamera
+    local method = currentMethod()
+    local gunLike = (Config.Weapon == "Gun")
+    local synthetic = (method == "Mouse" or method == "Touch")
+    -- a câmera só é controlada com Gun/fruta; com Melee/Sword ela fica livre
+    Aim.on = gunLike and (synthetic or method == "Tool")
+    if cam and os.clock() - lastPoint > 0.3 then
+        lastPoint = os.clock()
+        if synthetic then
+            Aim.px, Aim.py = safePoint(cam.ViewportSize)
+        else
+            Aim.px, Aim.py = cursorPoint(cam.ViewportSize)
+        end
+    end
+    doAttack(method)
+    if method == "Net" then
+        -- o ritmo vem dos slots; Fast/Super não esperam nada (1 frame)
+        return (Config.AttackMode == "Normal Attack") and 0.01 or 0
+    end
+    local cps = AttackCPS[Config.AttackMode] or 3
+    if Config.Weapon == "Gun" then cps = math.min(cps, 8) end -- arma de fogo tem delay de tiro
+    return (1 / cps) * (0.85 + math.random() * 0.3)
+end
+
+task.spawn(function()
+    while Alive do
+        local ok, w = pcall(attackTick)
+        task.wait(ok and w or 0.1)
+    end
+end)
+
+-- ============ INIMIGOS ============
+local function enemiesList()
+    local f = workspace:FindFirstChild("Enemies")
+    return f and f:GetChildren() or {}
+end
+
+-- Nome do mob bate se for igual OU começar com o nome (ex.: "Bandit [Lv. 5]")
+local function matchName(enemyName, names)
+    for _, n in ipairs(names) do
+        if enemyName == n or string.sub(enemyName, 1, #n) == n then return true end
+    end
+    return false
+end
+
+local function aliveParts(e)
+    local eh, er = e:FindFirstChildOfClass("Humanoid"), e:FindFirstChild("HumanoidRootPart")
+    if eh and er and eh.Health > 0 then return eh, er end
+end
+
+local function findEnemy(names)
+    local _, hrp = getChar()
+    if not hrp then return end
+    local best, bestDist = nil, math.huge
+    for _, e in ipairs(enemiesList()) do
+        local eh, er = aliveParts(e)
+        if eh and matchName(e.Name, names) then
+            local d = (hrp.Position - er.Position).Magnitude
+            if d < bestDist then best, bestDist = e, d end
+        end
+    end
+    return best
+end
+
+local function countAlive(names)
+    local n = 0
+    for _, e in ipairs(enemiesList()) do
+        if aliveParts(e) and matchName(e.Name, names) then n += 1 end
+    end
+    return n
+end
+
+-- ============ LOTES DE 2 MOBS ============
+-- Mesmo com Bring alto (ex.: 4 mobs juntos), só 2 mobs por vez são atacados; a cada ~1,5s (ou quando
+-- o par morre) passa para os 2 seguintes. Isso reduz o risco de ban.
+local Batch = { pair = {}, idx = 1, switchAt = 0, expires = 0 }
+function Batch.update(group)
+    local alive = {}
+    for _, m in ipairs(group) do
+        if aliveParts(m) then alive[#alive + 1] = m end
+    end
+    local chunks = math.max(1, math.ceil(#alive / 2))
+    local now = os.clock()
+    if now >= Batch.switchAt then
+        Batch.idx = Batch.idx % chunks + 1
+        Batch.switchAt = now + 1.5
+    end
+    if Batch.idx > chunks then Batch.idx = 1 end
+    Batch.pair = { alive[Batch.idx * 2 - 1], alive[Batch.idx * 2] }
+    Batch.expires = now + 0.5
+end
+
+-- ============ NET (seu attack.lua, usado no método "Net") ============
+-- Mesma lógica do script enviado: RegisterAttack + RegisterHit + remote de validação.
+-- Diferenças: (1) só dispara quando o hub está atacando; (2) bate SOMENTE em workspace.Enemies
+-- (a pasta Characters, onde ficam os outros jogadores, foi removida); (3) as esperas têm timeout,
+-- para o script não travar se alguma pasta/remote não existir.
+-- Normal Attack = 1 ataque por vez (como o seu loop). Fast = 5 simultâneos, Super Fast = 8, sem esperar nada; o FREIO AUTOMÁTICO (pelo FPS) reduz sozinho se o jogo começar a engasgar.
+local NetAtk = { ready = false, inflight = 0, lastDone = 0, err = "iniciando...", remote = nil, id = nil,
+    netModule = nil, seed = nil, reg = nil, hit = nil, cloneref = nil }
+-- Limites anti-crash: poucos alvos por ciclo, poucos ciclos simultâneos e intervalo mínimo entre ciclos
+local NET_LIMIT = { ["Normal Attack"] = 1, ["Fast Attack"] = 5, ["Super Fast Attack"] = 8 }
+local NET_GAP   = { ["Normal Attack"] = 0.10, ["Fast Attack"] = 0.015, ["Super Fast Attack"] = 0 } -- Super: sem intervalo (1 lote por frame)
+local NET_MAX_TARGETS = 2 -- no máximo 2 mobs por golpe
+local netLastLaunch = 0
+
+-- Freio anti-crash: mede o tempo dos frames. Se o jogo engasgar (frame > ~45ms em média), o ataque cai
+-- para 1 ciclo por vez e só volta ao normal quando o FPS se recuperar.
+local Perf = { ema = 0.016, slow = false }
+table.insert(Connections, RunService.Heartbeat:Connect(function(dt)
+    Perf.ema = Perf.ema * 0.9 + math.min(dt, 0.5) * 0.1
+    if Perf.ema > 0.045 then Perf.slow = true elseif Perf.ema < 0.03 then Perf.slow = false end
+end))
+
+task.spawn(function()
+    NetAtk.cloneref = cloneref or function(x) return x end
+    local folders = {}
+    for _, name in ipairs({ "Util", "Common", "Remotes", "Assets", "FX" }) do
+        local f = ReplicatedStorage:WaitForChild(name, 5)
+        if f then folders[#folders + 1] = f end
+    end
+    local function check(obj)
+        if obj:IsA("RemoteEvent") and obj:GetAttribute("Id") then
+            NetAtk.remote, NetAtk.id = obj, obj:GetAttribute("Id")
+        end
+    end
+    for _, folder in ipairs(folders) do
+        for _, child in ipairs(folder:GetChildren()) do check(child) end
+        table.insert(Connections, folder.ChildAdded:Connect(check))
+    end
+    local ok, err = pcall(function()
+        local modules = ReplicatedStorage:WaitForChild("Modules", 5)
+        local netFolder = modules and modules:WaitForChild("Net", 5)
+        assert(netFolder, "ReplicatedStorage.Modules.Net não encontrado")
+        NetAtk.netModule = require(netFolder)
+        NetAtk.seed = netFolder:WaitForChild("seed", 5)
+        NetAtk.reg = netFolder:WaitForChild("RE/RegisterAttack", 5)
+        NetAtk.hit = netFolder:WaitForChild("RE/RegisterHit", 5)
+        assert(NetAtk.seed and NetAtk.reg and NetAtk.hit, "remotes de ataque não encontrados")
+    end)
+    NetAtk.ready = ok
+    NetAtk.lastDone = os.clock()
+    NetAtk.err = ok and "ok" or tostring(err)
+    if not ok then Watch.skip["Net"] = true end -- sem os remotes: sai do ciclo automático
+end)
+
+-- Um ciclo do seu loop
+local function netAttackOnce()
+    local char = Player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then return end
+    local weaponType = tool:GetAttribute("WeaponType") or tool.ToolTip
+    -- Melee e Sword sempre; fruta só quando "Blox Fruit (M1)" estiver selecionado
+    if weaponType ~= "Melee" and weaponType ~= "Sword"
+        and not (Config.Weapon == "Blox Fruit" and weaponType == "Blox Fruit") then return end
+
+    -- alvos: só inimigos (NPCs) a até 60 studs
+    local targets = {}
+    local source = (os.clock() < Batch.expires) and Batch.pair or enemiesList()
+    for _, enemy in ipairs(source) do
+        local eh, er = aliveParts(enemy)
+        if eh and (er.Position - root.Position).Magnitude <= 60 then
+            targets[#targets + 1] = { enemy, er } -- 1 parte por mob (mandar todas as partes travava o jogo)
+            if #targets >= NET_MAX_TARGETS then break end
+        end
+    end
+    if #targets == 0 then return end
+
+    -- registra o RegisterHit no máximo 1x por segundo (repetir isso a cada ciclo acumulava conexões)
+    if os.clock() - (NetAtk.regAt or 0) > 1 then
+        NetAtk.regAt = os.clock()
+        NetAtk.netModule:RemoteEvent("RegisterHit", true)
+    end
+    NetAtk.reg:FireServer()
+
+    local head = targets[1][1]:FindFirstChild("Head")
+    if head and NetAtk.remote and NetAtk.id then
+        local uidStr = tostring(Player.UserId):sub(2, 4)
+        local coStr = tostring(coroutine.running()):sub(11, 15)
+        NetAtk.hit:FireServer(head, targets, {}, uidStr .. coStr)
+
+        local remoteName = string.gsub("RE/RegisterHit", ".", function(c)
+            return string.char(bit32.bxor(string.byte(c), math.floor((workspace:GetServerTimeNow() / 10) % 10) + 1))
+        end)
+        local seedValue = NetAtk.seed:InvokeServer() * 2
+        local xorValue = bit32.bxor(NetAtk.id + 909090, seedValue)
+        NetAtk.cloneref(NetAtk.remote):FireServer(remoteName, xorValue, head, targets)
+    end
+end
+
+-- Mantém no máximo N ciclos em andamento (N depende do modo de ataque escolhido).
+-- Cada ciclo ocupa um "slot" que EXPIRA em 1,2s: se o servidor demorar a responder, o slot é liberado
+-- e o ataque continua (antes ele parava por até 5s quando um ciclo ficava preso).
+NetAtk.slots, NetAtk.seq = {}, 0
+local function netInflight()
+    local now, n = os.clock(), 0
+    for id, t in pairs(NetAtk.slots) do
+        if now - t > 1.2 then NetAtk.slots[id] = nil else n += 1 end
+    end
+    return n
+end
+
+doNetAttack = function()
+    if not NetAtk.ready then return false end
+    local limit = NET_LIMIT[Config.AttackMode] or 1
+    local gap = NET_GAP[Config.AttackMode] or 0.1
+    -- freio gradual pelo tempo de frame: o jogo engasgando é o que causa o crash
+    if Perf.ema > 0.045 then
+        limit, gap = 1, math.max(gap, 0.12)
+    elseif Perf.ema > 0.028 then
+        limit = math.max(1, math.ceil(limit / 2))
+        gap = math.max(gap, 0.03)
+    end
+    local now = os.clock()
+    if now - netLastLaunch < gap then return true end
+    local free = limit - netInflight()
+    for _ = 1, math.max(0, free) do
+        netLastLaunch = os.clock()
+        NetAtk.seq += 1
+        local id = NetAtk.seq
+        NetAtk.slots[id] = netLastLaunch
+        task.spawn(function()
+            pcall(netAttackOnce)
+            NetAtk.slots[id] = nil
+            NetAtk.lastDone = os.clock()
+        end)
+    end
+    return true
+end
+
+-- ============ LUTA (posição, puxar mobs, medir dano) ============
+local Fight = { active = false, expires = 0, standCF = nil, pullCF = nil, mobs = {}, inPos = false, pos = nil, enemy = nil }
+
+-- Altura efetiva: a escolhida nas Settings; desce sozinha se o ataque não causar dano
+local PULL_GAP = 13 -- distância vertical entre o jogador e o mob puxado (cabe 1 jogador no meio)
+local function effHover(canPull)
+    local h = Config.HoverHeight
+    if Watch.stage >= 2 then
+        h = math.min(h, 16)
+    elseif Watch.stage == 1 then
+        h = math.min(h, 20)
+    end
+    if not canPull then h = math.min(h, 16) end -- boss: sempre perto
+    return h
+end
+
+-- Mede se o alvo está perdendo vida; se não estiver (por 3s, já em posição), troca de método
+local function watchStep(enemy, eh)
+    local now = os.clock()
+    if Watch.enemy ~= enemy then
+        Watch.enemy, Watch.hp, Watch.lastDmg = enemy, eh.Health, now
+    else
+        if eh.Health < Watch.hp - 0.01 then
+            Watch.lastDmg, Watch.confirmed = now, true
+        end
+        Watch.hp = eh.Health
+    end
+    if not Fight.inPos then
+        Watch.lastDmg = now -- ainda voando: não conta
+        return
+    end
+    if Config.AttackMethod ~= "Auto" then return end
+    if now - Watch.lastDmg > 2 then
+        Watch.confirmed = false
+        Watch.lastDmg = now
+        for _ = 1, #METHODS do
+            Watch.mi = Watch.mi % #METHODS + 1
+            if Watch.mi == 1 then Watch.stage = (Watch.stage + 1) % 3 end
+            if not Watch.skip[METHODS[Watch.mi]] then break end
+        end
+    end
+end
+
+-- Mobs do mesmo tipo para puxar junto (total = Config.Bring, contando o alvo)
+local function collectBring(main, names, center)
+    local list = { main }
+    for _, e in ipairs(enemiesList()) do
+        if #list >= Config.Bring then break end
+        if e ~= main and matchName(e.Name, names) then
+            local eh, er = aliveParts(e)
+            if eh and (er.Position - center).Magnitude < 350 then
+                list[#list + 1] = e
+            end
+        end
+    end
+    return list
+end
+
+-- Posiciona o jogador no alto e puxa o mob para 3 studs ABAIXO dele (o golpe alcança de cima).
+-- A posição é reaplicada a cada frame (Heartbeat) para o mob não voltar ao chão entre um ciclo e outro.
+local GUN_DIST = 9 -- Gun: o mob fica 9 studs à frente, na MESMA altura (câmera reta)
+local function fightEnemy(enemy, names, canPull)
+    local eh, er = aliveParts(enemy)
+    if not eh then return end
+    equipWeapon()
+    local gun = (Config.Weapon == "Gun")
+    Aim.level = gun
+    if not canPull then State.bossAt = os.clock() end -- lutando contra boss: o Collect Fruit espera
+
+    if Fight.enemy ~= enemy then
+        Fight.enemy = enemy
+        Fight.pos = er.Position -- posição original do mob, antes de puxar
+    end
+    local base = canPull and Fight.pos or er.Position
+    local h = effHover(canPull)
+    local stand, pullCF
+    if gun then
+        if canPull then
+            local p = base + Vector3.new(0, h, 0)
+            stand = CFrame.lookAt(p, p + Vector3.new(0, 0, 1))
+            pullCF = CFrame.new(p + Vector3.new(0, 0, GUN_DIST))
+        else
+            local p = er.Position + Vector3.new(0, 4, -14)
+            stand = CFrame.lookAt(p, Vector3.new(er.Position.X, p.Y, er.Position.Z))
+        end
+    else
+        stand = CFrame.new(base + Vector3.new(0, h, 0)) * CFrame.Angles(math.rad(-90), 0, 0)
+        if canPull then pullCF = CFrame.new(base + Vector3.new(0, h - math.min(PULL_GAP, h - 4), 0)) end
+    end
+    Fight.standCF, Fight.pullCF = stand, pullCF
+    Fight.mobs = canPull and collectBring(enemy, names, base) or {}
+    Fight.active, Fight.expires = true, os.clock() + 0.5
+
+    -- ataca só 2 mobs por vez (revezando entre os puxados)
+    Batch.update(#Fight.mobs > 0 and Fight.mobs or { enemy })
+    local _, tr = aliveParts(Batch.pair[1] or enemy)
+    Aim.part = tr or er
+
+    local near = false
+    local _, hrp = getChar()
+    if hrp then
+        Fight.inPos = (hrp.Position - stand.Position).Magnitude < 8
+        near = (hrp.Position - er.Position).Magnitude < 40
+        if Fight.inPos then
+            if currentTween then currentTween:Cancel() end
+        else
+            flyTo(stand)
+        end
+    end
+
+    watchStep(enemy, eh)
+    if Fight.inPos or near then Config.AttackUntil = os.clock() + 0.8 end -- liga o ataque automático
+    Diag.attack = string.format("método=%s%s | altura=%s | dano confirmado=%s | net=%s",
+        currentMethod(), (Config.AttackMethod == "Auto") and " (auto)" or "",
+        tostring(math.floor(h)), Watch.confirmed and "sim" or "ainda não",
+        NetAtk.ready and "pronto" or NetAtk.err)
+    Diag.attack = Diag.attack .. fruitNote()
+end
+
+table.insert(Connections, RunService.Heartbeat:Connect(function()
+    if not (Alive and Fight.active) then return end
+    if os.clock() > Fight.expires then
+        Fight.active, Fight.inPos = false, false
+        return
+    end
+    local _, hrp = getChar()
+    if not hrp then return end
+    -- jogador: já perto do ponto => fica exatamente nele (de frente para baixo)
+    if Fight.standCF and (hrp.Position - Fight.standCF.Position).Magnitude < 8 then
+        hrp.CFrame = Fight.standCF
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    end
+    -- mobs: mantém todos no ponto puxado
+    if Fight.pullCF then
+        for _, m in ipairs(Fight.mobs) do
+            local eh, er = aliveParts(m)
+            if eh then
+                er.CFrame = Fight.pullCF
+                er.CanCollide = false
+                eh.WalkSpeed = 0
+            end
+        end
+    end
+end))
+
+-- Mobs só carregam perto do spawn: acha o ponto de spawn pelo nome
+local function findSpawn(names)
+    local origin = workspace:FindFirstChild("_WorldOrigin")
+    local folders = {}
+    local f1 = origin and origin:FindFirstChild("EnemySpawns")
+    local f2 = workspace:FindFirstChild("EnemySpawns")
+    if f1 then table.insert(folders, f1) end
+    if f2 then table.insert(folders, f2) end
+    local best, bestDist = nil, math.huge
+    for _, folder in ipairs(folders) do
+        for _, sp in ipairs(folder:GetChildren()) do
+            for _, n in ipairs(names) do
+                if string.find(sp.Name, n, 1, true) then
+                    local d = distanceTo(sp.CFrame)
+                    if d < bestDist then best, bestDist = sp, d end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- ============ QUESTS (sem prender: tentativas e tempo limitados) ============
+local QuestGui
+local function findQuestGui()
+    if QuestGui and QuestGui.Parent then return QuestGui end
+    local pg = Player:FindFirstChild("PlayerGui")
+    local main = pg and pg:FindFirstChild("Main")
+    if main then QuestGui = main:FindFirstChild("Quest") or main:FindFirstChild("Quest", true) end
+    return QuestGui
+end
+
+-- Retorna (visível, conseguiu_ler)
+local function questVisible()
+    local q = findQuestGui()
+    if not q then return false, false end
+    return q.Visible == true, true
+end
+
+local function activeQuestTitle()
+    local q = findQuestGui()
+    if not q then return nil end
+    local t = q:FindFirstChild("QuestTitle", true)
+    if not t then return nil end
+    local label = t:FindFirstChild("Title") or t
+    if label:IsA("TextLabel") then return label.Text end
+end
+
+local function isEliteTitle(title)
+    if not title then return false end
+    for _, n in ipairs(EliteNames) do
+        if string.find(title, n, 1, true) then return true end
+    end
+    return false
+end
+
+local Quest = { key = nil, acceptedAt = 0, guiSeen = false, tries = 0, cooldownUntil = 0, travelSince = 0 }
+
+-- Comparação frouxa (ignora plural e erro de grafia, ex.: "Posessed" x "Possessed"):
+-- o título da quest contém as 3 primeiras letras de alguma palavra do nome do mob
+local function looseMatch(title, mobName)
+    if not title then return false end
+    local t = string.lower(title)
+    for word in string.gmatch(string.lower(mobName), "%a+") do
+        if #word >= 4 and string.find(t, string.sub(word, 1, 3), 1, true) then return true end
+    end
+    return false
+end
+
+-- Retorna true somente enquanto está VOANDO até o NPC. Aceitar a quest nunca bloqueia o farm.
+local function questStep(q, keepActive)
+    local now = os.clock()
+    local key = q.quest .. ":" .. q.idx
+    local visible, known = questVisible()
+
+    if Quest.key == key then
+        if visible then Quest.guiSeen = true end
+        if known then
+            local failed   = (not Quest.guiSeen) and (not visible) and now - Quest.acceptedAt > 15
+            local finished = Quest.guiSeen and (not visible) and now - Quest.acceptedAt > 3
+            if failed then
+                Quest.key = nil
+                if Quest.tries >= 3 then Quest.cooldownUntil = now + 90; Quest.tries = 0 end
+                Diag.quest = "quest não apareceu na tela; seguindo sem ela"
+            elseif finished then
+                Quest.key, Quest.tries = nil, 0
+            else
+                return false
+            end
+        else
+            -- não consegui ler a janela da quest: renova a cada 150s
+            if now - Quest.acceptedAt < 150 then return false end
+            Quest.key = nil
+        end
+    end
+
+    if now < Quest.cooldownUntil then return false end
+
+    -- já existe outra quest ativa?
+    if known and visible then
+        local title = activeQuestTitle()
+        if isEliteTitle(title) then return false end -- não mexe na quest do Elite Hunter
+        -- Dough/Bones: se já existe uma quest desse mob em andamento, NÃO pega outra
+        if keepActive and (looseMatch(title, q.mob) or not title) then
+            Quest.key, Quest.guiSeen, Quest.acceptedAt = key, true, now
+            Diag.quest = "quest em andamento (" .. tostring(title) .. "); só pego outra quando completar"
+            return false
+        end
+        local stem = string.sub(q.mob, 1, math.max(4, #q.mob - 2)) -- tolera plural
+        if title and string.find(title, stem, 1, true) then
+            Quest.key, Quest.guiSeen, Quest.acceptedAt = key, true, now
+            return false
+        end
+        invoke("AbandonQuest")
+        task.wait(0.4)
+    end
+
+    -- precisa estar perto do NPC (no máximo 45s de viagem, depois desiste por 60s)
+    if distanceTo(q.npc) > 20 then
+        if Quest.travelSince == 0 then Quest.travelSince = now end
+        if now - Quest.travelSince > 45 then
+            Quest.travelSince, Quest.cooldownUntil = 0, now + 60
+            Diag.quest = "viagem até o NPC demorou demais; seguindo sem quest"
+            return false
+        end
+        State.Text = "Indo ao NPC da quest (" .. q.mob .. ")"
+        flyTo(q.npc)
+        return true
+    end
+
+    Quest.travelSince = 0
+    State.Text = "Aceitando quest (" .. q.mob .. ")"
+    local ok, r = invoke("StartQuest", q.quest, q.idx)
+    Diag.quest = (ok and "StartQuest -> " or "StartQuest erro -> ") .. tostring(r)
+    Quest.key, Quest.acceptedAt, Quest.guiSeen = key, now, false
+    Quest.cur = q
+    Quest.tries += 1
+    return false
+end
+
+-- Escolhe a quest do Mar atual pelo level ATUAL (relido a cada ciclo)
+local function pickLevelQuest()
+    local list = QuestTables[getSea()]
+    local lvl = getPlayerLevel()
+    if lvl < list[1].min then return nil end
+    for _, q in ipairs(list) do
+        if lvl >= q.min and lvl <= q.max then return q end
+    end
+    return list[#list]
+end
+
+-- Um passo de farm: (opcional) pega a quest e, SEMPRE depois, ataca os mobs
+local function farmQuestStep(q, label, autoQuest, fallbackNames, keepActive)
+    -- trocou de modo de farm: esquece a quest do modo anterior
+    if Quest.mode ~= Config.Mode then
+        Quest.mode, Quest.key, Quest.cur = Config.Mode, nil, nil
+    end
+    -- enquanto a quest pegada não terminar, continua nos mobs DELA (mesmo que o level tenha subido)
+    if autoQuest and Quest.key and Quest.cur then q = Quest.cur end
+    if not q then
+        State.Text = "Level baixo demais para o Mar " .. getSea()
+        return
+    end
+    local lvl = getPlayerLevel()
+    if autoQuest and q.npc and lvl >= q.min then
+        if questStep(q, keepActive) then return end -- só retorna aqui enquanto voa até o NPC
+    end
+
+    local names = q.mobs
+    local mob = findEnemy(names)
+    if not mob and fallbackNames then
+        mob = findEnemy(fallbackNames)
+        if mob then names = fallbackNames end
+    end
+
+    Diag.fight = string.format("%s | mob alvo: %s | vivos: %d | level %d (quest pede %d)",
+        label, q.mob, countAlive(q.mobs), lvl, q.min)
+
+    if mob then
+        State.Text = label .. ": batendo em " .. mob.Name
+        fightEnemy(mob, names, true)
+        return
+    end
+
+    -- sem mob carregado: vai até onde eles nascem
+    local sp = findSpawn(q.mobs)
+    if sp then
+        State.Text = label .. ": indo até onde " .. q.mob .. " nasce"
+        flyTo(sp.CFrame * CFrame.new(0, Config.HoverHeight, 0))
+    elseif q.npc then
+        State.Text = label .. ": procurando " .. q.mob .. " perto do NPC"
+        local ang = (os.clock() / 3) % (math.pi * 2)
+        flyTo(q.npc * CFrame.new(math.cos(ang) * 120, 25, math.sin(ang) * 120))
+    else
+        State.Text = label .. ": não achei onde " .. q.mob .. " nasce"
+    end
+end
+
+-- ============ STACK FARM (sempre na frente do Normal Farm) ============
+-- Mar 3: Pirate Raid - mobs dos Mares 1/2 aparecem perto do Castle on the Sea (a cada ~1h15)
+local PR = { lastSeen = 0, lastProbe = 0, probeUntil = 0 }
+local PIRATE_POINT = CFrame.new(-5539, 313, -2972) -- Castle on the Sea (posição aproximada)
+local function pirateRaidStep()
+    local _, hrp = getChar()
+    if not hrp then return false end
+    local best, bestDist = nil, math.huge
+    for _, e in ipairs(enemiesList()) do
+        if RaidSet[e.Name] then
+            local eh, er = aliveParts(e)
+            if eh then
+                local d = (hrp.Position - er.Position).Magnitude
+                if d < bestDist then best, bestDist = e, d end
+            end
+        end
+    end
+    local now = os.clock()
+    if best then
+        PR.lastSeen = now
+        State.Mode = "Auto Pirate Raid"
+        State.Text = "Matando " .. best.Name
+        fightEnemy(best, { best.Name }, true)
+        return true
+    end
+    -- Os mobs da raid só carregam perto do Castle on the Sea. Entre uma onda e outra, fica por lá.
+    if now - PR.lastSeen < 25 then
+        State.Mode, State.Text = "Auto Pirate Raid", "Aguardando a próxima onda"
+        if distanceTo(PIRATE_POINT) > 150 then flyTo(PIRATE_POINT * CFrame.new(0, 40, 0)) end
+        return true
+    end
+    -- Sem raid à vista: a cada 90s vai ao Castle olhar se ela começou (tempo da viagem + 6s)
+    if now >= PR.probeUntil and now - PR.lastProbe > 90 then
+        PR.lastProbe = now
+        PR.probeUntil = now + distanceTo(PIRATE_POINT) / math.max(Config.TweenSpeed, 50) + 6
+    end
+    if now < PR.probeUntil then
+        State.Mode, State.Text = "Auto Pirate Raid", "Procurando a raid no Castle on the Sea"
+        flyTo(PIRATE_POINT * CFrame.new(0, 40, 0))
+        return true
+    end
+    return false
+end
+
+-- Mar 3: Elite Hunter - pega a quest e mata o Deandre / Urban / Diablo
+local EliteAsk = 0
+local EliteS = { travelSince = 0, pauseUntil = 0 }
+-- NPC Elite Hunter (procura no workspace.NPCs; senão usa a posição conhecida perto do Castle on the Sea)
+local function eliteNpcCF()
+    local npcs = workspace:FindFirstChild("NPCs")
+    local m = npcs and npcs:FindFirstChild("Elite Hunter")
+    local part = m and (m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart"))
+    return part and part.CFrame or CFrame.new(-5418, 314, -2825)
+end
+local function eliteStep(askQuest)
+    local boss = findEnemy(EliteNames)
+    if boss then
+        State.Mode = "Auto Elite Hunter"
+        State.Text = "Matando " .. boss.Name
+        fightEnemy(boss, EliteNames, false)
+        return true
+    end
+    -- o elite ainda não carregou: o modelo fica em ReplicatedStorage, voa até a posição dele
+    for _, n in ipairs(EliteNames) do
+        local m = ReplicatedStorage:FindFirstChild(n)
+        local part = m and (m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart)
+        if part then
+            State.Mode = "Auto Elite Hunter"
+            State.Text = "Indo até " .. n
+            flyTo(part.CFrame * CFrame.new(0, 20, 0))
+            return true
+        end
+    end
+    -- sem elite ativo: vai até o NPC Elite Hunter e pede a quest (só se "Auto Quest Elite Hunter" estiver ligado)
+    if askQuest and os.clock() >= EliteS.pauseUntil then
+        local visible, known = questVisible()
+        local hasEliteQuest = known and visible and isEliteTitle(activeQuestTitle())
+        if not hasEliteQuest then
+            local cf = eliteNpcCF()
+            if distanceTo(cf) > 25 then
+                if EliteS.travelSince == 0 then EliteS.travelSince = os.clock() end
+                if os.clock() - EliteS.travelSince > 45 then
+                    EliteS.travelSince, EliteS.pauseUntil = 0, os.clock() + 60
+                    Diag.elite = "viagem até o Elite Hunter demorou demais; tento de novo em 60s"
+                    return false
+                end
+                State.Mode, State.Text = "Auto Elite Hunter", "Indo ao NPC Elite Hunter"
+                flyTo(cf * CFrame.new(0, 3, 4))
+                return true
+            end
+            EliteS.travelSince = 0
+            State.Mode, State.Text = "Auto Elite Hunter", "Pedindo a quest ao Elite Hunter"
+            if os.clock() - EliteAsk > 12 then
+                EliteAsk = os.clock()
+                if known and visible then -- tem outra quest ativa: abandona antes
+                    invoke("AbandonQuest")
+                    task.wait(0.4)
+                end
+                local ok, r = invoke("EliteHunter")
+                Diag.elite = (ok and "EliteHunter -> " or "erro -> ") .. tostring(r)
+                local low = string.lower(tostring(r))
+                if string.find(low, "later", 1, true) or string.find(low, "don't have", 1, true)
+                    or string.find(low, "come back", 1, true) then
+                    EliteS.pauseUntil = os.clock() + 120 -- sem elite disponível agora: volta ao farm e tenta depois
+                    return false
+                end
+            end
+            return true
+        end
+    end
+    return false
+end
+
+-- Mar 2: Factory Raid - o boss "Core" aparece na Factory a cada ~1h30 (5 min para matar)
+local function factoryStep()
+    local core = findEnemy({ "Core" })
+    if not core then return false end
+    State.Mode = "Auto Factory"
+    State.Text = "Matando o Core"
+    fightEnemy(core, { "Core" }, false)
+    return true
+end
+
+local function stackStep()
+    local sea = getSea()
+    if sea == 3 then
+        if Config.PirateRaid and pirateRaidStep() then return true end
+        if Config.Elite and eliteStep(Config.EliteQuest) then return true end
+    elseif sea == 2 then
+        if Config.Factory and factoryStep() then return true end
+    end
+    return false
+end
+
+local function posOf(inst)
+    if inst:IsA("BasePart") then return inst.CFrame end
+    if inst:IsA("Model") then return inst:GetPivot() end
+end
+
+-- ============ NORMAL FARM ============
+-- Inventário (frutas guardadas e itens de quest): cache de 5s
+local InvCache = { at = 0, map = {} }
+local function invCount(name)
+    if os.clock() - InvCache.at > 5 then
+        InvCache.at = os.clock()
+        local ok, inv = invoke("getInventory")
+        if ok and type(inv) == "table" then
+            local m = {}
+            for _, it in pairs(inv) do
+                if type(it) == "table" and it.Name then m[it.Name] = (m[it.Name] or 0) + (tonumber(it.Count) or 1) end
+            end
+            InvCache.map = m
+        end
+    end
+    return InvCache.map[name] or 0
+end
+
+-- Tem o item? (na mochila/mão ou no inventário)
+local function hasItem(name)
+    for _, c in ipairs({ Player.Backpack, Player.Character }) do
+        if c and c:FindFirstChild(name) then return true end
+    end
+    return invCount(name) > 0
+end
+
+local CocoaMobs  = { "Cocoa Warrior", "Chocolate Bar Battler" }
+local CocoaQuest = Q(2300, 9999, "ChocQuest1", 1, "Cocoa Warrior", 231, 23, -12200)
+
+local function bossAlive(name) return findEnemy({ name }) end
+
+-- Bosses: só mata se a opção respectiva estiver ligada; o boss tem prioridade sobre os NPCs
+local function bossKillStep()
+    local list = {
+        { Config.KillReaper,      "Soul Reaper", "Auto Kill Soul Reaper" },
+        { Config.KillDoughKing,   "Dough King",  "Auto Kill Dough King" },
+        { Config.KillDoughPrince, "Cake Prince", "Auto Kill Dough Prince" },
+    }
+    for _, b in ipairs(list) do
+        if b[1] then
+            local boss = bossAlive(b[2])
+            if boss then
+                State.Mode, State.Text = b[3], "Matando " .. boss.Name
+                fightEnemy(boss, { boss.Name }, false)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- Invocações (cada uma só roda com a sua opção ligada)
+local Summon = { prince = 0, king = 0, reaper = 0, bones = 0 }
+local function summonStep()
+    if getSea() ~= 3 then return false end
+    local now = os.clock()
+    -- Dough Prince: com o Sweet Chalice na hotbar o jogo invoca o Dough King, então só sem ele
+    if Config.SummonDoughPrince and now - Summon.prince > 6 and not bossAlive("Cake Prince") then
+        Summon.prince = now
+        if hasItem("Sweet Chalice") then
+            Diag.summon = "Dough Prince: você tem o Sweet Chalice (o jogo invocaria o Dough King)"
+        else
+            task.spawn(function()
+                local ok, r = invoke("CakePrinceSpawner")
+                Diag.summon = "Dough Prince: " .. (ok and "" or "erro ") .. tostring(r)
+            end)
+        end
+    end
+    -- Dough King: precisa do Sweet Chalice
+    if Config.SummonDoughKing and now - Summon.king > 6 and not bossAlive("Dough King") then
+        Summon.king = now
+        if hasItem("Sweet Chalice") then
+            task.spawn(function()
+                local ok, r = invoke("CakePrinceSpawner")
+                Diag.summon = "Dough King: " .. (ok and "" or "erro ") .. tostring(r)
+            end)
+        else
+            Diag.summon = "Dough King: sem Sweet Chalice (use o Auto Dough King para conseguir)"
+        end
+    end
+    -- Random Bones (gasta Bones a cada giro)
+    if Config.RandomBones and now - Summon.bones > 10 then
+        Summon.bones = now
+        task.spawn(function()
+            local ok, r = invoke("Bones", "Buy", 1, 1)
+            Diag.bones = "Random Bones: " .. (ok and "" or "erro ") .. tostring(r)
+        end)
+    end
+    -- Soul Reaper: usa a Hallow Essence no altar (precisa estar com ela)
+    if Config.SummonReaper and not bossAlive("Soul Reaper") then
+        if not hasItem("Hallow Essence") then
+            Diag.summon = "Soul Reaper: sem Hallow Essence"
+        elseif now - Summon.reaper > 8 then
+            local map = workspace:FindFirstChild("Map")
+            local hc = map and map:FindFirstChild("Haunted Castle")
+            local altar = hc and hc:FindFirstChild("Summoner", true)
+            local cf = altar and posOf(altar)
+            if not cf then
+                Diag.summon = "Soul Reaper: altar não encontrado (vá ao Haunted Castle com a Hallow Essence)"
+            elseif distanceTo(cf) > 14 then
+                State.Mode, State.Text = "Auto Summon Soul Reaper", "Indo ao altar"
+                flyTo(cf * CFrame.new(0, 4, 0))
+                return true
+            else
+                Summon.reaper = now
+                local _, hrp, hum = getChar()
+                local tool = Player.Backpack:FindFirstChild("Hallow Essence")
+                if tool and hum then pcall(function() hum:EquipTool(tool) end) end
+                pcall(function()
+                    for _, d in ipairs(altar:GetDescendants()) do
+                        if d:IsA("BasePart") and hrp then
+                            firetouchinterest(hrp, d, 0)
+                            firetouchinterest(hrp, d, 1)
+                        end
+                    end
+                    if altar:IsA("BasePart") and hrp then
+                        firetouchinterest(hrp, altar, 0)
+                        firetouchinterest(hrp, altar, 1)
+                    end
+                end)
+                Diag.summon = "Soul Reaper: toquei no altar com a Hallow Essence"
+            end
+        end
+    end
+    return false
+end
+
+-- Auto Farm Dough Prince: farma os NPCs da Cake Land (kill e summon são opções separadas)
+local function doughStep()
+    State.Mode = "Auto Farm Dough Prince"
+    farmQuestStep(DoughQuest, "Dough Prince", Config.AutoQuestDough, CakeMobs, true)
+end
+
+-- Auto Dough King: 1) Elite Hunter até dropar o God's Chalice  2) 10 Conjured Cocoa
+-- 3) troca no Sweet Crafter pelo Sweet Chalice  4) com o cálice, farma a Cake Land (500 kills)
+local lastTrade = 0
+local function kingStep()
+    State.Mode = "Auto Dough King"
+    if hasItem("Sweet Chalice") then
+        Diag.summon = Diag.summon:find("Dough King") and Diag.summon or "Sweet Chalice pronto: farmando a Cake Land (500 kills)"
+        farmQuestStep(DoughQuest, "Dough King", Config.AutoQuestKing, CakeMobs, true)
+        return
+    end
+    if not hasItem("God's Chalice") then
+        State.Text = "Elite Hunter (procurando God's Chalice)"
+        if eliteStep(Config.AutoQuestKing) then return end
+        farmQuestStep(DoughQuest, "Dough King", Config.AutoQuestKing, CakeMobs, true)
+        return
+    end
+    local cocoa = invCount("Conjured Cocoa")
+    if cocoa < 10 then
+        State.Text = string.format("Farmando Conjured Cocoa (%d/10)", cocoa)
+        farmQuestStep(CocoaQuest, "Cocoa", Config.AutoQuestKing, CocoaMobs, true)
+        return
+    end
+    State.Text = "Trocando pelo Sweet Chalice"
+    if os.clock() - lastTrade > 8 then
+        lastTrade = os.clock()
+        InvCache.at = 0
+        local ok, r = invoke("SweetChaliceNpc")
+        Diag.summon = "Sweet Crafter: " .. (ok and "" or "erro ") .. tostring(r)
+    end
+    if distanceTo(CocoaQuest.npc) > 300 then flyTo(CocoaQuest.npc) end -- Chocolate Land (o NPC fica por perto)
+end
+
+-- Um passo do Normal Farm (chamado pelo loop principal, depois do Stack Farm)
+local function normalStep()
+    if bossKillStep() then
+        State.Busy = true
+        return
+    end
+    if summonStep() then
+        State.Busy = true
+        return
+    end
+    local mode = Config.Mode
+    if mode == "Level" then
+        State.Busy = true
+        local lvl, sea = getPlayerLevel(), getSea()
+        local hint = ((sea == 1 and lvl >= 700) or (sea == 2 and lvl >= 1500)) and " [já pode subir de Mar]" or ""
+        State.Mode = "Auto Farm Level" .. hint
+        farmQuestStep(pickLevelQuest(), "Lv." .. lvl, true, nil)
+    elseif mode == "Dough" then
+        State.Busy = true
+        doughStep()
+    elseif mode == "King" then
+        State.Busy = true
+        kingStep()
+    elseif mode == "Bones" then
+        State.Busy = true
+        State.Mode = "Auto Farm Bones"
+        farmQuestStep(BonesQuest, "Bones", Config.AutoQuestBones, HauntedMobs, true)
+    end
+end
+
+-- ============ FRUITS ============
+-- Contagem de frutas físicas (nome contém "Fruit")
+local function countFruits()
+    local n = 0
+    for _, c in ipairs({ Player.Backpack, Player.Character }) do
+        if c then
+            for _, t in ipairs(c:GetChildren()) do
+                if t:IsA("Tool") and string.find(t.Name, "Fruit") then n += 1 end
+            end
+        end
+    end
+    return n
+end
+
+-- Auto Store: no máximo 2 tentativas por fruta (fruta nova = tentativas novas)
+local StoreTries = setmetatable({}, { __mode = "k" })
+local function storeStep()
+    for _, c in ipairs({ Player.Backpack, Player.Character }) do
+        if c then
+            for _, t in ipairs(c:GetChildren()) do
+                if t:IsA("Tool") and string.find(t.Name, "Fruit") and (StoreTries[t] or 0) < 2 then
+                    StoreTries[t] = (StoreTries[t] or 0) + 1
+                    invoke("StoreFruit", t:GetAttribute("OriginalName") or t.Name, t)
+                    task.wait(0.3)
+                end
+            end
+        end
+    end
+end
+
+-- Auto Random Fruit (gacha). Cooldown de 2h compartilhado entre os mares.
+-- 1) tenta o remote de onde estiver; 2) se não vier fruta, voa até o NPC e tenta de novo
+--    (remote, ProximityPrompt e botão da janela do gacha). O resultado fica em Status > Diagnóstico.
+local Gacha = { nextAt = 0, last = "ainda não girou", tries = 0, phase = "idle", travelSince = 0, pauseUntil = 0 }
+pcall(function()
+    if canFile() and isfile("MoonHub_gacha.txt") then
+        Gacha.nextAt = tonumber(readfile("MoonHub_gacha.txt")) or 0
+    end
+end)
+local function saveGacha()
+    pcall(function()
+        if canFile() then writefile("MoonHub_gacha.txt", tostring(Gacha.nextAt)) end
+    end)
+end
+
+local function describe(v)
+    if type(v) == "table" then
+        local parts, n = {}, 0
+        for k, x in pairs(v) do
+            n += 1
+            if n > 5 then break end
+            parts[#parts + 1] = tostring(k) .. "=" .. tostring(x)
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
+    end
+    return tostring(v)
+end
+
+local function npcPart(m)
+    return m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+end
+
+-- Nomes de NPCs por perto (ajuda a achar o NPC certo se o gacha mudar de nome)
+local function nearbyNpcNames()
+    local names, seen = {}, {}
+    local _, hrp = getChar()
+    local npcs = workspace:FindFirstChild("NPCs")
+    if npcs and hrp then
+        for _, m in ipairs(npcs:GetChildren()) do
+            local part = npcPart(m)
+            if part and not seen[m.Name] and (part.Position - hrp.Position).Magnitude < 400 then
+                seen[m.Name] = true
+                names[#names + 1] = m.Name
+                if #names >= 8 then break end
+            end
+        end
+    end
+    return #names > 0 and table.concat(names, ", ") or "nenhum"
+end
+
+local ZiolesCache, ZiolesLast = nil, 0
+local function findGachaNpc()
+    local _, hrp = getChar()
+    -- NPC "Zioles": primeiro em workspace.NPCs, depois uma busca geral (no máx. a cada 5s)
+    if ZiolesCache and ZiolesCache.Parent then return ZiolesCache end
+    local z = workspace:FindFirstChild("NPCs") and workspace.NPCs:FindFirstChild("Zioles")
+    if not z and os.clock() - ZiolesLast > 5 then
+        ZiolesLast = os.clock()
+        z = workspace:FindFirstChild("Zioles", true)
+    end
+    if z and z:IsA("Model") and npcPart(z) then
+        ZiolesCache = z
+        return z
+    end
+    local npcs = workspace:FindFirstChild("NPCs")
+    if not npcs then return end
+    local best, bestD = nil, math.huge
+    for _, m in ipairs(npcs:GetChildren()) do
+        local n = string.lower(m.Name)
+        if string.find(n, "cousin", 1, true) or string.find(n, "gacha", 1, true) or string.find(n, "zioles", 1, true) then
+            local part = npcPart(m)
+            if part then
+                local d = hrp and (hrp.Position - part.Position).Magnitude or 0
+                if d < bestD then best, bestD = m, d end
+            end
+        end
+    end
+    return best
+end
+
+-- Chama o remote e confere se veio fruta (ou se a resposta parece o tempo restante do cooldown)
+-- Quantas frutas estão GUARDADAS no inventário (o gacha pode mandar a fruta direto para lá)
+local function invFruitCount()
+    local ok, inv = invoke("getInventoryFruits")
+    if ok and type(inv) == "table" then
+        local n = 0
+        for _ in pairs(inv) do n += 1 end
+        return n
+    end
+end
+
+-- Recebeu fruta? (mochila OU inventário)
+local function gotFruit(beforeBag, beforeInv)
+    if countFruits() > beforeBag then return true end
+    local now = invFruitCount()
+    return beforeInv ~= nil and now ~= nil and now > beforeInv
+end
+
+local function tryRoll()
+    local before, beforeInv = countFruits(), invFruitCount()
+    local ok, r
+    local net = ReplicatedStorage:FindFirstChild("Modules") and ReplicatedStorage.Modules:FindFirstChild("Net")
+    local rf = net and net:FindFirstChild("RF/GachaNetworkRF")
+    if rf then
+        ok, r = pcall(function()
+            return rf:InvokeServer({ Context = "Purchase", BoxName = "ZiolesGacha" })
+        end)
+    else
+        ok, r = invoke("Cousin", "Buy") -- plano B (remote antigo)
+    end
+    Gacha.tries += 1
+    Gacha.last = (ok and "resposta: " or "erro: ") .. describe(r)
+    task.wait(1.5)
+    if gotFruit(before, beforeInv) then return true, "fruta recebida" end
+    if ok and type(r) == "string" then
+        local l = string.lower(r)
+        if string.find(l, "cooldown", 1, true) or string.find(l, "wait", 1, true)
+            or string.find(l, "hour", 1, true) or string.find(l, "minute", 1, true) then
+            return true, "em cooldown (texto do jogo)", 1800
+        end
+    end
+    if ok and type(r) == "number" and r >= 30 and r <= 7200 then
+        return true, "em cooldown", math.floor(r)
+    end
+    if ok and type(r) == "table" then
+        if r.Success == true or r.success == true then return true, "gacha aceito" end
+        for k, v in pairs(r) do
+            local key = string.lower(tostring(k))
+            if type(v) == "number" and v >= 30 and v <= 7200
+                and (string.find(key, "cool", 1, true) or string.find(key, "remain", 1, true) or string.find(key, "time", 1, true)) then
+                return true, "em cooldown (" .. tostring(k) .. ")", math.floor(v)
+            end
+        end
+    end
+    return false
+end
+
+-- Plano B: ProximityPrompt do NPC e botão de girar dentro de uma janela de gacha
+local function pressGachaUi(npc)
+    pcall(function()
+        for _, d in ipairs(npc:GetDescendants()) do
+            if d:IsA("ProximityPrompt") then
+                fireproximityprompt(d)
+                break
+            elseif d:IsA("ClickDetector") and fireclickdetector then
+                fireclickdetector(d)
+            end
+        end
+    end)
+    task.wait(1.2)
+    pcall(function()
+        local pg = Player:FindFirstChild("PlayerGui")
+        if not pg or not firesignal then return end
+        for _, b in ipairs(pg:GetDescendants()) do
+            if (b:IsA("TextButton") or b:IsA("ImageButton")) and b.Visible then
+                local inGacha, a = false, b.Parent
+                while a and a ~= pg do
+                    local n = string.lower(a.Name)
+                    if string.find(n, "gacha", 1, true) or string.find(n, "cousin", 1, true) then
+                        inGacha = true
+                        break
+                    end
+                    a = a.Parent
+                end
+                if inGacha then
+                    local label = string.lower(b.Name .. " " .. (b:IsA("TextButton") and b.Text or ""))
+                    if string.find(label, "roll", 1, true) or string.find(label, "spin", 1, true)
+                        or string.find(label, "buy", 1, true) or string.find(label, "open", 1, true)
+                        or string.find(label, "girar", 1, true) then
+                        firesignal(b.MouseButton1Click)
+                        Gacha.last = "cliquei em: " .. b:GetFullName()
+                        return
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- Retorna true enquanto estiver usando o personagem (voando até o NPC)
+local function gachaMission()
+    local now = os.time()
+    if now < Gacha.nextAt or now < Gacha.pauseUntil then return false end
+    if getPlayerLevel() < 50 then
+        Diag.gacha = "nível mínimo 50 para o gacha"
+        return false
+    end
+
+    -- 1) tentativa direta, de onde estiver
+    if Gacha.phase == "idle" then
+        local done, why, secs = tryRoll()
+        if done then
+            Gacha.nextAt = os.time() + (secs or 7200)
+            Gacha.tries = 0
+            saveGacha()
+            Diag.gacha = "ok (" .. why .. ") | " .. Gacha.last
+            return false
+        end
+        Gacha.phase, Gacha.travelSince = "travel", os.clock()
+    end
+
+    -- 2) vai até o NPC (no máximo 40s de viagem)
+    local npc = findGachaNpc()
+    local part = npc and npcPart(npc)
+    if part and distanceTo(part.CFrame) > 10 and os.clock() - Gacha.travelSince < 40 then
+        State.Mode, State.Text = "Auto Random Fruit", "Indo ao Zioles"
+        flyTo(part.CFrame * CFrame.new(0, 4, 5))
+        return true
+    elseif not part and getSea() == 1 and os.clock() - Gacha.travelSince < 40 then
+        -- Zioles ainda não carregou (o jogo só carrega NPCs perto): vai para Middle Town (posição aproximada)
+        State.Mode, State.Text = "Auto Random Fruit", "Indo a Middle Town (procurando Zioles)"
+        flyTo(CFrame.new(-655, 12, 1573))
+        return true
+    end
+
+    -- 3) chegou (ou o NPC não foi achado): remote de novo, depois prompt/botão
+    State.Mode, State.Text = "Auto Random Fruit", "Girando"
+    local done, why, secs = tryRoll()
+    if not done and npc then
+        local before, beforeInv = countFruits(), invFruitCount()
+        pressGachaUi(npc)
+        task.wait(2)
+        if gotFruit(before, beforeInv) then done, why = true, "fruta recebida (NPC/janela)" end
+    end
+    Gacha.phase = "idle"
+    if done then
+        Gacha.nextAt = os.time() + (secs or 7200)
+        Gacha.tries = 0
+        saveGacha()
+        Diag.gacha = "ok (" .. why .. ") | " .. Gacha.last
+        return false
+    end
+    Gacha.pauseUntil = os.time() + ((Gacha.tries < 3) and 120 or 900)
+    Diag.gacha = string.format("falhou (%d tentativas) | %s | NPC: %s | NPCs por perto: %s",
+        Gacha.tries, Gacha.last, npc and npc.Name or "não achado", nearbyNpcNames())
+    return false
+end
+
+-- Auto Collect: frutas no chão (inclusive as que acabaram de nascer)
+local FruitBlacklist = setmetatable({}, { __mode = "k" })
+local CollectTarget, CollectStart = nil, 0
+
+local function findGroundFruit()
+    local _, hrp = getChar()
+    if not hrp then return end
+    local best, bestDist = nil, math.huge
+    for _, v in ipairs(workspace:GetChildren()) do
+        if v:IsA("Tool") and string.find(v.Name, "Fruit") and (FruitBlacklist[v] or 0) < os.clock() then
+            local handle = v:FindFirstChild("Handle")
+            if handle then
+                local d = (hrp.Position - handle.Position).Magnitude
+                if d < bestDist then best, bestDist = v, d end
+            end
+        end
+    end
+    return best
+end
+
+local function collectStep(fruit)
+    local handle = fruit:FindFirstChild("Handle")
+    if not handle then return end
+    if CollectTarget ~= fruit then CollectTarget, CollectStart = fruit, os.clock() end
+    if os.clock() - CollectStart > 25 then -- travou: ignora essa fruta por 60s
+        FruitBlacklist[fruit] = os.clock() + 60
+        CollectTarget = nil
+        return
+    end
+    State.Mode = "Auto Collect Fruit"
+    State.Text = "Coletando " .. fruit.Name
+    flyTo(handle.CFrame)
+    local _, hrp = getChar()
+    if hrp and (hrp.Position - handle.Position).Magnitude < 15 then
+        pcall(function()
+            firetouchinterest(hrp, handle, 0)
+            firetouchinterest(hrp, handle, 1)
+        end)
+    end
+end
+
+-- ============ AUTO BUY FRUITS (stock normal) ============
+-- Uma única tentativa por stock (o stock normal reseta a cada 4h). Ordem de prioridade: compra a PRIMEIRA
+-- fruta da lista que estiver à venda e para ali, sem tentar as de prioridade menor.
+local FruitNames = { "Rocket-Rocket", "Spin-Spin", "Blade-Blade", "Spring-Spring", "Bomb-Bomb", "Smoke-Smoke",
+    "Spike-Spike", "Flame-Flame", "Falcon-Falcon", "Ice-Ice", "Sand-Sand", "Dark-Dark", "Diamond-Diamond",
+    "Light-Light", "Rubber-Rubber", "Ghost-Ghost", "Magma-Magma", "Quake-Quake", "Buddha-Buddha", "Love-Love",
+    "Creation-Creation", "Spider-Spider", "Sound-Sound", "Phoenix-Phoenix", "Portal-Portal", "Rumble-Rumble",
+    "Pain-Pain", "Blizzard-Blizzard", "Gravity-Gravity", "Mammoth-Mammoth", "T-Rex-T-Rex", "Dough-Dough",
+    "Shadow-Shadow", "Venom-Venom", "Gas-Gas", "Control-Control", "Spirit-Spirit", "Dragon-Dragon",
+    "Leopard-Leopard", "Yeti-Yeti", "Kitsune-Kitsune" }
+
+local Buy = { epoch = nil, reads = 0 }
+local function buyStep()
+    local epoch = math.floor(os.time() / 14400)
+    if Buy.epoch == epoch then return end
+    local prios = {}
+    for _, f in ipairs(Config.BuyPrio) do
+        if f and f ~= "Nenhuma" then prios[#prios + 1] = f end
+    end
+    if #prios == 0 then
+        Diag.buy = "escolha ao menos 1 fruta nas prioridades"
+        return
+    end
+    local ok, stock = invoke("GetFruits")
+    if not ok or type(stock) ~= "table" then
+        Buy.reads += 1
+        Diag.buy = "não consegui ler o stock: " .. tostring(stock)
+        if Buy.reads >= 3 then Buy.epoch, Buy.reads = epoch, 0 end
+        return
+    end
+    Buy.reads, Buy.epoch = 0, epoch -- daqui em diante: só 1 tentativa neste stock
+    local hasFlag, onSale = false, {}
+    for _, v in pairs(stock) do
+        if type(v) == "table" and v.Name then
+            if v.OnSale ~= nil then hasFlag = true end
+        end
+    end
+    for _, v in pairs(stock) do
+        if type(v) == "table" and v.Name and ((not hasFlag) or v.OnSale == true) then
+            onSale[string.lower(v.Name)] = v.Name
+        end
+    end
+    for i, want in ipairs(prios) do
+        local real = onSale[string.lower(want)]
+        if real then
+            local ok2, r = invoke("PurchaseRawFruit", real)
+            Diag.buy = string.format("prioridade %d (%s): %s -> %s", i, real, ok2 and "tentei comprar" or "erro", tostring(r))
+            return
+        end
+    end
+    Diag.buy = "nenhuma fruta da sua lista está no stock normal agora"
+end
+
+-- ============ RAIDS ============
+-- Tabela de frutas: { nome, preço, raridade } (C comum, U incomum, R rara, L lendária, M mítica)
+-- Usada para NUNCA gastar fruta Mítica (nem Lendária no modo -1M). Fruta desconhecida/skin = proibida.
+local FruitTable = {
+    { "rocket", 50000, "C" }, { "spin", 75000, "C" }, { "blade", 100000, "C" }, { "spring", 180000, "C" },
+    { "bomb", 220000, "C" }, { "smoke", 100000, "C" }, { "spike", 180000, "C" },
+    { "flame", 250000, "U" }, { "falcon", 300000, "U" }, { "ice", 350000, "U" }, { "sand", 420000, "U" },
+    { "dark", 500000, "U" }, { "diamond", 600000, "U" },
+    { "light", 650000, "R" }, { "rubber", 750000, "R" }, { "ghost", 940000, "R" }, { "magma", 960000, "R" },
+    { "quake", 1000000, "L" }, { "buddha", 1200000, "L" }, { "love", 1300000, "L" }, { "creation", 1400000, "L" },
+    { "spider", 1500000, "L" }, { "sound", 1700000, "L" }, { "phoenix", 1800000, "L" }, { "portal", 1900000, "L" },
+    { "rumble", 2100000, "L" }, { "pain", 2300000, "L" }, { "blizzard", 2400000, "L" },
+    { "gravity", 2500000, "M" }, { "mammoth", 2700000, "M" }, { "t-rex", 2700000, "M" }, { "dough", 2800000, "M" },
+    { "shadow", 2900000, "M" }, { "venom", 3000000, "M" }, { "gas", 3200000, "M" }, { "control", 3200000, "M" },
+    { "spirit", 3400000, "M" }, { "dragon", 3500000, "M" }, { "yeti", 3500000, "M" }, { "leopard", 5000000, "M" },
+    { "kitsune", 8000000, "M" },
+}
+
+local function fruitInfo(tool)
+    local raw = string.lower(tostring(tool:GetAttribute("OriginalName") or tool.Name))
+    if string.find(raw, "skin", 1, true) then return nil end
+    for _, f in ipairs(FruitTable) do
+        local b = f[1]
+        if string.sub(raw, 1, #b) == b then
+            local nx = string.sub(raw, #b + 1, #b + 1)
+            if nx == "" or nx == "-" or nx == " " then return f end
+        end
+    end
+end
+
+local function payEligible(f, only1M)
+    if not f or f[3] == "M" then return false end
+    if only1M and (f[3] == "L" or f[2] >= 1000000) then return false end
+    return true
+end
+
+local function physicalFruits()
+    local list = {}
+    for _, c in ipairs({ Player.Backpack, Player.Character }) do
+        if c then
+            for _, t in ipairs(c:GetChildren()) do
+                if t:IsA("Tool") and string.find(t.Name, "Fruit") then list[#list + 1] = t end
+            end
+        end
+    end
+    return list
+end
+
+local Raid = { payAt = 0, fails = 0, pressAt = 0, pausedUntil = 0 }
+
+local function hasChip()
+    for _, c in ipairs({ Player.Backpack, Player.Character }) do
+        if c and c:FindFirstChild("Special Microchip") then return true end
+    end
+    return false
+end
+
+local function raidActive()
+    local ok, v = pcall(function() return Player.PlayerGui.Main.Timer.Visible end)
+    if ok and v == true then return true end
+    local loc = workspace:FindFirstChild("_WorldOrigin") and workspace._WorldOrigin:FindFirstChild("Locations")
+    return loc ~= nil and loc:FindFirstChild("Island 1") ~= nil
+end
+
+-- Compra o chip. Em modo Fruta: antes de pagar, guarda no inventário TODA fruta proibida (Mítica, Lendária
+-- no modo -1M, skin ou desconhecida). Se alguma não puder ser guardada, NÃO paga.
+local function payChip()
+    if Config.PayMode == "Fruta" then
+        local usable, blocked = {}, {}
+        for _, t in ipairs(physicalFruits()) do
+            if payEligible(fruitInfo(t), Config.PayOnly1M) then usable[#usable + 1] = t else blocked[#blocked + 1] = t end
+        end
+        if #usable == 0 then
+            Diag.raid = "Auto Pay (fruta): nenhuma fruta permitida na mochila (nada foi gasto)"
+            return false
+        end
+        for _, t in ipairs(blocked) do
+            invoke("StoreFruit", t:GetAttribute("OriginalName") or t.Name, t)
+            task.wait(0.4)
+        end
+        for _, t in ipairs(blocked) do
+            if t.Parent == Player.Backpack or t.Parent == Player.Character then
+                Diag.raid = "Auto Pay (fruta): não consegui guardar " .. t.Name .. " (proibida). NÃO paguei."
+                return false
+            end
+        end
+        local _, _, hum = getChar()
+        if hum and usable[1].Parent then pcall(function() hum:EquipTool(usable[1]) end) end
+        task.wait(0.3)
+    end
+    local ok, r = invoke("RaidsNpc", "Select", Config.RaidType)
+    Diag.raid = string.format("Auto Pay (%s) %s -> %s", Config.PayMode, Config.RaidType, ok and describe(r) or ("erro: " .. tostring(r)))
+    task.wait(1)
+    return hasChip()
+end
+
+-- Botão que inicia a Raid (Mar 2: Hot and Cold Island | Mar 3: Castle on the Sea)
+local function raidButton()
+    local map = workspace:FindFirstChild("Map")
+    if not map then return end
+    local btn
+    pcall(function()
+        if getSea() == 3 then btn = map["Boat Castle"].RaidSummon2.Button.Main
+        elseif getSea() == 2 then btn = map.CircleIsland.RaidSummon.Button.Main end
+    end)
+    if not (btn and btn:FindFirstChildOfClass("ClickDetector")) then
+        btn = nil
+        local sm = map:FindFirstChild("RaidSummon2", true) or map:FindFirstChild("RaidSummon", true)
+        local m = sm and sm:FindFirstChild("Main", true)
+        if m and m:FindFirstChildOfClass("ClickDetector") then btn = m end
+    end
+    return btn
+end
+
+-- Auto Raid: mata os mobs da raid e segue para a ilha mais avançada
+local function raidFightStep()
+    State.Mode = "Auto Raid"
+    local _, hrp = getChar()
+    local best, bd = nil, 600
+    for _, e in ipairs(enemiesList()) do
+        local eh, er = aliveParts(e)
+        if eh and hrp then
+            local d = (hrp.Position - er.Position).Magnitude
+            if d < bd then best, bd = e, d end
+        end
+    end
+    if best then
+        State.Text = "Raid: matando " .. best.Name
+        fightEnemy(best, { best.Name }, true)
+        return true
+    end
+    local loc = workspace:FindFirstChild("_WorldOrigin") and workspace._WorldOrigin:FindFirstChild("Locations")
+    if loc then
+        for i = 5, 1, -1 do
+            local isl = loc:FindFirstChild("Island " .. i)
+            local cf = isl and posOf(isl)
+            if cf then
+                State.Text = "Raid: indo para a ilha " .. i
+                flyTo(cf * CFrame.new(0, 40, 0))
+                return true
+            end
+        end
+    end
+    State.Text = "Raid: aguardando mobs"
+    return true
+end
+
+-- Retorna true enquanto estiver usando o personagem
+local function raidStep()
+    if not (Config.AutoStartRaid or Config.AutoRaid or Config.AutoPay) then return false end
+    local sea = getSea()
+    if sea == 1 then
+        Diag.raid = "Raids só existem nos Mares 2 e 3"
+        return false
+    end
+    if raidActive() then
+        if Config.AutoRaid then return raidFightStep() end
+        return false
+    end
+    local now = os.time()
+    local chip = hasChip()
+    if not chip and Config.AutoPay and now >= Raid.payAt and getPlayerLevel() >= 1100 then
+        State.Mode, State.Text = "Raids", "Comprando chip (" .. Config.RaidType .. ")"
+        if payChip() then
+            Raid.fails = 0
+            chip = true
+        else
+            Raid.fails += 1
+            Raid.payAt = now + ((Raid.fails < 3) and 60 or 600)
+        end
+    end
+    if chip and Config.AutoStartRaid and os.clock() - Raid.pressAt > 12 then
+        local btn = raidButton()
+        if not btn then
+            Diag.raid = "botão da Raid não encontrado: vá até Hot and Cold Island (Mar 2) ou Castle on the Sea (Mar 3)"
+            return false
+        end
+        State.Mode = "Raids"
+        if distanceTo(btn.CFrame) > 25 then
+            State.Text = "Indo ao botão da Raid"
+            flyTo(btn.CFrame * CFrame.new(0, 6, 8))
+            return true
+        end
+        State.Text = "Iniciando a Raid"
+        pcall(function() fireclickdetector(btn:FindFirstChildOfClass("ClickDetector")) end)
+        Raid.pressAt = os.clock()
+        Diag.raid = "botão apertado (" .. Config.RaidType .. ")"
+        return true
+    elseif not chip and Config.AutoStartRaid and not Config.AutoPay then
+        Diag.raid = "sem Special Microchip (ligue o Auto Pay ou compre o chip)"
+    end
+    return false
+end
+
+-- ============ UTILIDADES EM SEGUNDO PLANO (Hakis, gacha, store) ============
+local Timers = {}
+local function pressKey(code)
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, code, false, game)
+        task.wait(0.06)
+        VirtualInputManager:SendKeyEvent(false, code, false, game)
+    end)
+end
+
+-- Instinct (Observação): a janela de overlay "ScreenGui.ImageLabel" aparece quando está ativo
+local Ken = { last = 0, presses = 0, seen = false }
+local function kenActive()
+    local ok, v = pcall(function()
+        local sg = Player.PlayerGui:FindFirstChild("ScreenGui")
+        return sg and sg:FindFirstChild("ImageLabel") ~= nil
+    end)
+    return ok and v == true
+end
+local function due(key, interval)
+    local now = os.clock()
+    if (Timers[key] or 0) <= now then
+        Timers[key] = now + interval
+        return true
+    end
+    return false
+end
+
+task.spawn(function()
+    while Alive do
+        task.wait(0.5)
+        pcall(function()
+            local char = getChar()
+            if char then
+                -- Haki do Armamento: só liga se ainda NÃO estiver ativo (o remote alterna on/off)
+                if Config.AutoBuso and due("buso", 2) and not char:FindFirstChild("HasBuso") then
+                    invoke("Buso")
+                end
+                -- Haki da Observação
+                if Config.AutoKen and due("ken", 1) then
+                    if kenActive() then
+                        Ken.seen, Ken.presses = true, 0
+                        Diag.ken = "ativo"
+                    else
+                        -- desativado: aperta E (se a detecção nunca funcionou, espera mais entre as tentativas)
+                        local gap = (Ken.presses >= 3 and not Ken.seen) and 60 or 5
+                        if os.clock() - Ken.last >= gap then
+                            Ken.last = os.clock()
+                            Ken.presses += 1
+                            pressKey(Enum.KeyCode.E)
+                            Diag.ken = "apertei E (" .. Ken.presses .. ")"
+                        end
+                    end
+                end
+                -- Raça V3 (habilidade)
+                if Config.AutoV3 and due("v3", 3) and CommE then
+                    pcall(function() CommE:FireServer("ActivateAbility") end)
+                end
+                -- Raça V4: tecla Y quando a barra está cheia e ainda não transformado
+                if Config.AutoV4 and due("v4", 2) then
+                    local re = char:FindFirstChild("RaceEnergy")
+                    local rt = char:FindFirstChild("RaceTransformed")
+                    if re and re.Value >= 1 and not (rt and rt.Value) then
+                        pressKey(Enum.KeyCode.Y)
+                    end
+                end
+            end
+            -- deixa os mobs puxados se moverem de verdade no seu cliente
+            if State.Busy and due("sim", 2) then
+                pcall(function() sethiddenproperty(Player, "SimulationRadius", math.huge) end)
+            end
+            if Config.AutoStore and due("store", 1) then storeStep() end
+            if Config.AutoBuy and due("buy", 20) then buyStep() end
+        end)
+    end
+end)
+
+-- ============ LOOP PRINCIPAL ============
+-- Prioridade: 1) fruta no chão (exceto durante boss)  2) gacha  3) Raids  4) Sub Farm  5) Normal Farm
+task.spawn(function()
+    while Alive do
+        task.wait(Config.Interval)
+        if getChar() then
+            local ok, err = pcall(function()
+                State.Busy = false
+
+                -- Lutando contra um boss? Então nada interrompe (nem fruta, nem gacha, nem raid)
+                local bossBusy = os.clock() - (State.bossAt or 0) < 1.5
+
+                if not bossBusy then
+                    -- 1) Auto Collect Fruit: acima de tudo, menos boss (pausa o farm sem desligar nada)
+                    if Config.CollectFruits then
+                        local fruit = findGroundFruit()
+                        if fruit then
+                            State.Busy = true
+                            collectStep(fruit)
+                            return
+                        end
+                    end
+
+                    -- 2) Auto Random Fruit (só quando o cooldown de 2h acabou)
+                    if Config.AutoGacha then
+                        if gachaMission() then
+                            State.Busy = true
+                            return
+                        end
+                    else
+                        Gacha.phase = "idle"
+                    end
+
+                    -- 2b) Raids (chip, iniciar e matar os mobs da raid)
+                    if raidStep() then
+                        State.Busy = true
+                        return
+                    end
+                end
+
+                -- 3) Sub Farm
+                if stackStep() then
+                    State.Busy = true
+                    return
+                end
+
+                -- 4) Normal Farm
+                normalStep()
+            end)
+            if not ok then
+                warn("[Moon Hub] Erro: " .. tostring(err))
+                Diag.fight = "ERRO: " .. tostring(err)
+            end
+        else
+            State.Busy = false
+        end
+        if not State.Busy then
+            State.Mode, State.Text = "Parado", "—"
+            Aim.part, Fight.active, Fight.inPos = nil, false, false
+            releaseChar()
+        end
+    end
+end)
+
+-- Anti-AFK
+table.insert(Connections, Player.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+end))
+
+-- ============ DADOS PARA A ABA STATUS ============
+local function fmt(sec)
+    sec = math.max(0, math.floor(sec))
+    return string.format("%02d:%02d:%02d", math.floor(sec / 3600), math.floor((sec % 3600) / 60), sec % 60)
+end
+
+local function toolText(tip)
+    local tool, equipped = findTool(tip)
+    if not tool then return "Nenhum" end
+    return tool.Name .. (equipped and " (equipado)" or "")
+end
+
+-- ============ INTERFACE (FLUENT) ============
+local okF, resF = pcall(function()
+    return loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+end)
+if not okF or not resF then
+    warn("[Moon Hub] Falha ao carregar a Fluent UI: " .. tostring(resF))
+    Alive = false
+    return
+end
+Fluent = resF
+
+-- Permite re-executar o script sem duplicar janelas/loops
+genv.MoonHubUnload = function()
+    Alive = false
+    State.Busy = false
+    for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
+    pcall(releaseChar)
+    Fight.active = false
+    pcall(restoreCamera)
+    pcall(function() RunService:UnbindFromRenderStep("MoonHubAim") end)
+    pcall(function() Fluent:Destroy() end)
+end
+
+Window = Fluent:CreateWindow({
+    Title = "Moon Hub ( No-Key )", SubTitle = "[ BETA ]",
+    TabWidth = 150, Size = UDim2.fromOffset(540, 440),
+    Acrylic = false, -- desligado = mais leve em executores mobile
+    Theme = "Darker", MinimizeKey = Enum.KeyCode.RightControl,
+})
+
+local Tabs = {
+    Status   = Window:AddTab({ Title = "Status",      Icon = "activity" }),
+    Settings = Window:AddTab({ Title = "Settings",    Icon = "settings" }),
+    Normal   = Window:AddTab({ Title = "Normal Farm", Icon = "swords" }),
+    Stack    = Window:AddTab({ Title = "Sub Farm",    Icon = "layers" }),
+    Fruits   = Window:AddTab({ Title = "Fruits",      Icon = "apple" }),
+}
+do
+    local okT, tab = pcall(function() return Window:AddTab({ Title = "Raids", Icon = "shield" }) end)
+    if not okT then tab = Window:AddTab({ Title = "Raids" }) end
+    Tabs.Raids = tab
+end
+
+-- ---------- 1) Status ----------
+local Info = {}
+local function addInfo(key, title)
+    Info[key] = Tabs.Status:AddParagraph({ Title = title, Content = "..." })
+end
+local function setInfo(key, text)
+    local p = Info[key]
+    if not p then return end
+    pcall(function()
+        if p.SetDesc then p:SetDesc(text) elseif p.SetValue then p:SetValue(text) end
+    end)
+end
+
+addInfo("mode",    "Modo de farm")
+addInfo("server",  "Servidor aberto há")
+addInfo("first",   "Tempo desde a primeira execução do script")
+addInfo("gacha",   "Próximo giro de fruta (estimado)")
+addInfo("stock",   "Stock Normal reseta em")
+addInfo("mirage",  "Stock Miragem reseta em")
+addInfo("race",    "Raça")
+addInfo("sword",   "Espada")
+addInfo("gun",     "Gun")
+addInfo("style",   "Estilo de luta")
+addInfo("level",   "Level")
+addInfo("nick",    "Nick")
+addInfo("diag",    "Diagnóstico (beta)")
+
+task.spawn(function()
+    while Alive do
+        pcall(function()
+            local now = os.time()
+            setInfo("mode",   State.Mode .. " — " .. State.Text)
+            setInfo("server", fmt(workspace.DistributedGameTime))
+            setInfo("first",  fmt(now - FirstRun))
+            if Gacha.nextAt > now then
+                setInfo("gacha", fmt(Gacha.nextAt - now))
+            else
+                setInfo("gacha", Config.AutoGacha and "pronto (girando...)" or "pronto / sem registro")
+            end
+            setInfo("stock",  fmt(14400 - now % 14400)) -- ciclo de 4h alinhado a 00:00 UTC
+            setInfo("mirage", fmt(7200 - now % 7200))   -- ciclo de 2h alinhado a 00:00 UTC
+            local okR, race = pcall(function() return Player.Data.Race.Value end)
+            setInfo("race",   okR and tostring(race) or "—")
+            setInfo("sword",  toolText("Sword"))
+            setInfo("gun",    toolText("Gun"))
+            setInfo("style",  toolText("Melee"))
+            setInfo("level",  tostring(getPlayerLevel()) .. "  (Mar " .. getSea() .. ")")
+            setInfo("nick",   Player.Name .. (Player.DisplayName ~= Player.Name and (" (" .. Player.DisplayName .. ")") or ""))
+            setInfo("diag",   "ataque: " .. Diag.attack .. "\nluta: " .. Diag.fight .. "\nquest: " .. Diag.quest ..
+                "\ninvocação: " .. Diag.summon .. "\nelite: " .. Diag.elite .. "\ngacha: " .. Diag.gacha ..
+                "\ncompra: " .. Diag.buy .. "\nraid: " .. Diag.raid .. "\ninstinct: " .. Diag.ken)
+        end)
+        task.wait(1)
+    end
+end)
+
+-- ---------- 2) Settings ----------
+Tabs.Settings:AddSection("Select Click Method")
+Tabs.Settings:AddDropdown("Weapon", {
+    Title = "Click",
+    Description = "Melee = soco | Sword | Gun (câmera reta, mira no cursor) | Blox Fruit (M1): bate com o M1 da fruta que você comeu (Dragon East/West, T-Rex, Gas, Ice ou Light)",
+    Values = { "Melee", "Sword", "Gun", "Blox Fruit (M1)" }, Default = 1,
+}):OnChanged(function(v) Config.Weapon = (v == "Blox Fruit (M1)") and "Blox Fruit" or v end)
+
+Tabs.Settings:AddSection("Select Mode Attack")
+Tabs.Settings:AddDropdown("AttackMode", {
+    Title = "Modo de ataque", Values = { "Normal Attack", "Fast Attack", "Super Fast Attack" }, Default = 1,
+    Description = "Normal = 1 ataque por vez (seu attack.lua) | Fast = 5 simultâneos | Super Fast = 8 simultâneos, com freio automático se o FPS cair. Quanto mais rápido, maior o risco de ban.",
+}):OnChanged(function(v) Config.AttackMode = v end)
+
+Tabs.Settings:AddSection("Farm Settings")
+Tabs.Settings:AddSlider("Bring", {
+    Title = "Bring Mob (quantos mobs puxar)", Min = 2, Max = 10, Default = 2, Rounding = 0,
+    Callback = function(v) Config.Bring = v end,
+})
+Tabs.Settings:AddToggle("AutoBuso", { Title = "Auto Buso (Haki do Armamento)", Default = true })
+    :OnChanged(function(v) Config.AutoBuso = v end)
+Tabs.Settings:AddToggle("AutoKen", { Title = "Auto Instinct (Haki da Observação, tecla E)", Default = false })
+    :OnChanged(function(v) Config.AutoKen = v end)
+Tabs.Settings:AddToggle("AutoV3", { Title = "Auto Use V3 (habilidade da raça)", Default = false })
+    :OnChanged(function(v) Config.AutoV3 = v end)
+Tabs.Settings:AddToggle("AutoV4", { Title = "Auto Use V4 (despertar da raça)", Default = false })
+    :OnChanged(function(v) Config.AutoV4 = v end)
+Tabs.Settings:AddSlider("Speed", {
+    Title = "Tween (velocidade de voo)", Min = 100, Max = 350, Default = 200, Rounding = 0,
+    Callback = function(v) Config.TweenSpeed = v end,
+})
+Tabs.Settings:AddSlider("Hover", {
+    Title = "Altura sobre os NPC", Description = "Se o ataque não causar dano, o script desce sozinho.",
+    Min = 12, Max = 55, Default = 26, Rounding = 0,
+    Callback = function(v) Config.HoverHeight = v end,
+})
+
+Tabs.Settings:AddSection("Advanced")
+Tabs.Settings:AddDropdown("AttackMethod", {
+    Title = "Método de ataque",
+    Description = "Auto = começa pelo Net (seu attack.lua) e troca sozinho se o mob não perder vida. Veja Status > Diagnóstico.",
+    Values = { "Auto", "Net", "Mouse", "Touch", "VirtualUser", "CombatFramework", "Tool" }, Default = 1,
+}):OnChanged(function(v) Config.AttackMethod = v end)
+Tabs.Settings:AddButton({
+    Title = "Resetar auto-ajuste de ataque",
+    Description = "Volta ao primeiro método e à altura escolhida",
+    Callback = function()
+        Watch.mi, Watch.stage, Watch.confirmed, Watch.skip = 1, 0, false, {}
+    end,
+})
+Tabs.Settings:AddDropdown("Sea", {
+    Title = "Mar (Auto = detecta sozinho)", Values = { "Auto", "1", "2", "3" }, Default = 1,
+}):OnChanged(function(v) Config.SeaOverride = tonumber(v) end) -- "Auto" vira nil
+
+-- ---------- 3) Normal Farm ----------
+-- Só um modo de farm por vez (Level / Dough Prince / Dough King / Bones): ligar um desliga os outros
+local Toggles = {}
+local function addModeToggle(id, title, mode, needSea3, desc)
+    local t = Tabs.Normal:AddToggle(id, { Title = title, Description = desc, Default = false })
+    Toggles[mode] = t
+    t:OnChanged(function(v)
+        if v then
+            if needSea3 and getSea() ~= 3 then
+                Fluent:Notify({ Title = "Moon Hub", Content = title .. " só funciona no Mar 3.", Duration = 5 })
+                t:SetValue(false)
+                return
+            end
+            Config.Mode = mode
+            for m, other in pairs(Toggles) do
+                if m ~= mode and other.Value then other:SetValue(false) end
+            end
+        elseif Config.Mode == mode then
+            Config.Mode = nil
+        end
+    end)
+end
+local function addOpt(tab, id, title, desc, key, default)
+    tab:AddToggle(id, { Title = title, Description = desc, Default = default or false })
+        :OnChanged(function(v) Config[key] = v end)
+end
+-- Sub título: um título escrito (sem caixa), menor que os títulos normais
+local function subTitle(tab, text)
+    local seen = {}
+    for _, d in ipairs(Window.Root:GetDescendants()) do
+        if d:IsA("TextLabel") then seen[d] = true end
+    end
+    pcall(function() tab:AddSection(text) end)
+    for _, d in ipairs(Window.Root:GetDescendants()) do
+        if d:IsA("TextLabel") and not seen[d] and d.Text == text then
+            pcall(function()
+                d.TextSize = 12
+                d.TextTransparency = 0.15
+            end)
+            break
+        end
+    end
+end
+
+Tabs.Normal:AddSection("Level Farm")
+addModeToggle("AutoLevel", "Auto Farm Level", "Level", false)
+
+Tabs.Normal:AddSection("Auto Dough King/Prince")
+subTitle(Tabs.Normal, "Dough Prince")
+addModeToggle("AutoDough", "Auto Farm Dough Prince", "Dough", true, "Farma os NPCs da Cake Land")
+addOpt(Tabs.Normal, "QuestDough", "Auto Quest Dough Prince", "Pega a quest dos Head Baker (só pega outra quando terminar a atual)", "AutoQuestDough", true)
+addOpt(Tabs.Normal, "KillPrince", "Auto Kill Dough Prince", "Só mata o boss com isto ligado; o boss vem antes dos NPCs", "KillDoughPrince")
+addOpt(Tabs.Normal, "SummonPrince", "Auto Summon Dough Prince", "Só invoca com isto ligado (precisa dos ~500 kills e sem Sweet Chalice)", "SummonDoughPrince")
+subTitle(Tabs.Normal, "Dough King")
+addModeToggle("AutoKing", "Auto Dough King", "King", true, "Elite Hunter até o God's Chalice, farma 10 Conjured Cocoa e troca pelo Sweet Chalice")
+addOpt(Tabs.Normal, "QuestKing", "Auto Quest Dough King", "Pega as quests (Elite Hunter / Cacau / Cake Land) sem pegar outra antes de terminar", "AutoQuestKing", true)
+addOpt(Tabs.Normal, "KillKing", "Auto Kill Dough King", "Só mata o boss com isto ligado; o boss vem antes dos NPCs", "KillDoughKing")
+addOpt(Tabs.Normal, "SummonKing", "Auto Summon Dough King", "Só invoca com isto ligado (precisa do Sweet Chalice)", "SummonDoughKing")
+
+Tabs.Normal:AddSection("Auto Bones")
+subTitle(Tabs.Normal, "Auto Farm Bones")
+addModeToggle("AutoBones", "Auto Farm Bones", "Bones", true, "Farma os NPCs do Haunted Castle")
+addOpt(Tabs.Normal, "QuestBones", "Auto Quest", "Pega a última quest do Haunted Castle (só pega outra quando terminar a atual)", "AutoQuestBones", true)
+subTitle(Tabs.Normal, "Bones Extra")
+addOpt(Tabs.Normal, "RandomBones", "Auto Random Bones", "Gira o Random Bones (gasta Bones a cada giro)", "RandomBones")
+addOpt(Tabs.Normal, "SummonReaper", "Auto Summon Soul Reaper", "Usa a Hallow Essence que você tiver no altar", "SummonReaper")
+addOpt(Tabs.Normal, "KillReaper", "Auto Kill Soul Reaper", "Só volta aos NPCs depois de matar o boss", "KillReaper")
+
+-- ---------- 4) Sub Farm ----------
+local function addStackToggle(id, title, key, sea)
+    local t = Tabs.Stack:AddToggle(id, { Title = title, Default = false })
+    t:OnChanged(function(v)
+        if v and getSea() ~= sea then
+            Fluent:Notify({ Title = "Moon Hub", Content = title .. " só funciona no Mar " .. sea .. ".", Duration = 5 })
+            t:SetValue(false)
+            return
+        end
+        Config[key] = v
+    end)
+end
+
+Tabs.Stack:AddSection("Third Sea")
+addStackToggle("PirateRaid", "Auto Pirate Raid", "PirateRaid", 3)
+Tabs.Stack:AddSection("Second Sea")
+addStackToggle("Factory",    "Auto Factory",      "Factory",    2)
+Tabs.Stack:AddSection("Elite Hunter")
+addStackToggle("Elite",      "Auto Elite Hunter", "Elite",      3)
+addOpt(Tabs.Stack, "EliteQuest", "Auto Quest Elite Hunter", "Pede a quest ao Elite Hunter (sem isto, só mata o elite que já existir)", "EliteQuest", true)
+
+-- ---------- 5) Fruits ----------
+Tabs.Fruits:AddSection("Random Fruit")
+Tabs.Fruits:AddToggle("AutoGacha", {
+    Title = "Auto Random Fruit", Description = "Gira o gacha de frutas com o Zioles (cooldown de 2h compartilhado entre os mares)", Default = false,
+}):OnChanged(function(v) Config.AutoGacha = v end)
+Tabs.Fruits:AddToggle("AutoStore", {
+    Title = "Auto Store", Description = "Tenta guardar cada fruta nova no máximo 2 vezes", Default = false,
+}):OnChanged(function(v) Config.AutoStore = v end)
+
+Tabs.Fruits:AddSection("Auto Collect Fruit")
+Tabs.Fruits:AddToggle("CollectFruit", {
+    Title = "Auto Collect Fruit", Description = "Tem prioridade sobre qualquer farm: pausa, pega a fruta e volta", Default = false,
+}):OnChanged(function(v) Config.CollectFruits = v end)
+
+Tabs.Fruits:AddSection("Auto Buy Fruits (Normal Stock)")
+do
+    local values = { "Nenhuma" }
+    for _, n in ipairs(FruitNames) do values[#values + 1] = n end
+    for i = 1, 5 do
+        Tabs.Fruits:AddDropdown("BuyPrio" .. i, {
+            Title = "Prioridade " .. i,
+            Description = (i == 1) and "Compra só a PRIMEIRA fruta da lista que estiver no stock e não tenta as de baixo" or nil,
+            Values = values, Default = 1,
+        }):OnChanged(function(v) Config.BuyPrio[i] = v end)
+    end
+end
+Tabs.Fruits:AddToggle("AutoBuy", {
+    Title = "Auto Buy", Description = "Uma única tentativa por stock (o stock normal reseta a cada 4h)", Default = false,
+}):OnChanged(function(v) Config.AutoBuy = v end)
+
+-- ---------- 6) Raids ----------
+Tabs.Raids:AddSection("Select Raid")
+Tabs.Raids:AddDropdown("RaidType", {
+    Title = "Raid", Values = { "Flame", "Ice", "Sand", "Dark", "Light", "Magma", "Quake", "Buddha", "Spider" }, Default = 1,
+}):OnChanged(function(v) Config.RaidType = v end)
+
+Tabs.Raids:AddSection("Raid Configs")
+local function raidToggle(id, title, desc, key)
+    Tabs.Raids:AddToggle(id, { Title = title, Description = desc, Default = false }):OnChanged(function(v)
+        Config[key] = v
+        if v and getSea() == 1 then
+            Fluent:Notify({ Title = "Moon Hub", Content = "Raids só existem nos Mares 2 e 3.", Duration = 5 })
+        end
+    end)
+end
+raidToggle("AutoStartRaid", "Auto Start Raid", "Voa até o botão e inicia a raid escolhida (precisa do chip)", "AutoStartRaid")
+raidToggle("AutoRaid", "Auto Raid", "Mata os mobs da raid e segue para a próxima ilha", "AutoRaid")
+raidToggle("AutoPay", "Auto Pay", "Compra o chip da raid escolhida (nível 1100+)", "AutoPay")
+Tabs.Raids:AddDropdown("PayMode", {
+    Title = "Pagar com", Description = "Fruta: nunca usa fruta Mítica (as proibidas são guardadas no inventário antes de pagar)",
+    Values = { "Dinheiro (Beli)", "Fruta" }, Default = 1,
+}):OnChanged(function(v) Config.PayMode = (v == "Fruta") and "Fruta" or "Beli" end)
+Tabs.Raids:AddToggle("PayOnly1M", {
+    Title = "Pay Raid only -1M Fruits",
+    Description = "Com Auto Pay em Fruta: usa só frutas abaixo de 1M (nunca Lendária, Mítica ou skin)", Default = false,
+}):OnChanged(function(v) Config.PayOnly1M = v end)
+
+Window:SelectTab(1)
+
+-- ---------- Visual: mais escuro, contornos brancos, nome colorido ----------
+local BLUE = Color3.fromRGB(64, 140, 255)
+local TITLE_RICH = '<font color="#FFFFFF">Moon Hub</font> <font color="#FFDD00">( No-Key )</font>'
+local SUB_RICH   = '<font color="#FF2828">[ BETA ]</font>'
+
+-- Mantém uma propriedade fixa: se a Fluent mudar (ao ativar uma opção, por ex.), volta ao valor
+local function lockProp(inst, prop, value)
+    pcall(function()
+        inst[prop] = value
+        inst:GetPropertyChangedSignal(prop):Connect(function()
+            pcall(function() if inst[prop] ~= value then inst[prop] = value end end)
+        end)
+    end)
+end
+
+-- Fundo um pouco mais escuro (só os cinzas; não mexe nas cores de destaque dos toggles)
+local function darken(obj)
+    if not (obj:IsA("Frame") or obj:IsA("ScrollingFrame") or obj:IsA("CanvasGroup")
+        or obj:IsA("TextButton") or obj:IsA("ImageButton") or obj:IsA("TextBox")) then return end
+    if obj:GetAttribute("MHDark") then return end
+    local c = obj.BackgroundColor3
+    local mx, mn = math.max(c.R, c.G, c.B), math.min(c.R, c.G, c.B)
+    if mx - mn < 0.08 and mx > 0.03 then
+        obj:SetAttribute("MHDark", true)
+        obj.BackgroundColor3 = Color3.new(c.R * 0.75, c.G * 0.75, c.B * 0.75)
+    end
+end
+
+local function styleWindow()
+    pcall(function() Fluent:SetTheme("Darker") end)
+    local root = Window and Window.Root
+    if not root then return end
+    -- contorno azul só na borda da janela
+    pcall(function()
+        local st = root:FindFirstChildOfClass("UIStroke")
+        if not st then
+            st = Instance.new("UIStroke")
+            st.Parent = root
+        end
+        st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        if not st:GetAttribute("MHLock") then
+            st:SetAttribute("MHLock", true)
+            lockProp(st, "Color", BLUE)
+            lockProp(st, "Transparency", 0)
+            lockProp(st, "Thickness", 2)
+            lockProp(st, "Enabled", true)
+        end
+    end)
+    for _, d in ipairs(root:GetDescendants()) do
+        pcall(darken, d)
+        -- título: [ BETA ] vermelho | Moon Hub branco | ( No-Key ) amarelo (rich text: não some ao ativar opções)
+        if d:IsA("TextLabel") and not d:GetAttribute("MHTitle") then
+            if d.Text == "Moon Hub ( No-Key )" then
+                d:SetAttribute("MHTitle", true)
+                lockProp(d, "RichText", true)
+                lockProp(d, "Text", TITLE_RICH)
+            elseif d.Text == "[ BETA ]" then
+                d:SetAttribute("MHTitle", true)
+                lockProp(d, "RichText", true)
+                lockProp(d, "Text", SUB_RICH)
+                lockProp(d, "TextColor3", Color3.fromRGB(255, 40, 40))
+            end
+        end
+    end
+end
+pcall(styleWindow)
+task.delay(1.5, function() if Alive then pcall(styleWindow) end end)
+pcall(function()
+    local gui = Fluent.GUI or Window.Root:FindFirstAncestorOfClass("ScreenGui")
+    if gui then
+        table.insert(Connections, gui.DescendantAdded:Connect(function(d)
+            task.defer(function() pcall(darken, d) end)
+        end))
+    end
+end)
+if IsBloxFruits then
+    Fluent:Notify({ Title = "Moon Hub ( No-Key )", Content = "Carregado no Mar " .. getSea() .. ".", Duration = 4 })
+else
+    Fluent:Notify({ Title = "Moon Hub ( No-Key )", Content = "Remote do Blox Fruits não encontrado: a UI abre, mas o farm não funciona neste jogo.", Duration = 8 })
+end
+
